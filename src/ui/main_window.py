@@ -34,8 +34,15 @@ class ScrollableTable(tk.Frame):
         self.columns = []
         self.data = []
         self.tags_list = []
+        self.base_row_height = 30
         self.row_height = 30
+        self.row_heights = [] # 新增：记录每行的高度
+        self.base_col_widths = []
         self.col_widths = []
+        self.freeze_panes = tk.BooleanVar(value=True) # 默认开启冻结
+        self.freeze_rows = tk.IntVar(value=1)  # 冻结前 N 行 (含表头)
+        self.freeze_cols = tk.IntVar(value=1)  # 冻结前 M 列
+        self.selected_cell = None # 新增：选中的单元格 (row_idx, col_idx)
         
         # 缓存的控件
         self.header_widgets = []
@@ -77,22 +84,35 @@ class ScrollableTable(tk.Frame):
     def clear(self):
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
+        if hasattr(self, 'header_widgets'):
+            for widget in self.header_widgets:
+                if widget: widget.destroy()
         self.header_widgets = []
         self.cell_widgets = {}
         self.data = []
         self.tags_list = []
+        self.row_heights = []
+        self.col_widths = []
 
     def set_data(self, columns, data, tags_list, row_height=30):
         self.clear()
         self.columns = columns
         self.data = data
         self.tags_list = tags_list
+        self.base_row_height = row_height
         self.row_height = row_height
+        self.selected_cell = None
         
         if not data:
             return
+        
+        # 1. 初始化列表长度
+        self.header_widgets = [None] * len(columns)
+        
+        # 2. 初始化每行高度 (表头 + 数据行)
+        self.row_heights = [row_height] * (len(data) + 1)
 
-        # 预计算每列的大致宽度
+        # 3. 预计算每列的大致基础宽度
         def get_display_width(s):
             """计算字符串在显示时的近似宽度（中文字符占 1.8 倍宽度）"""
             width = 0
@@ -103,90 +123,154 @@ class ScrollableTable(tk.Frame):
                     width += 1
             return width
 
-        self.col_widths = [80] * len(columns)
+        self.base_col_widths = [80] * len(columns)
         for i, col in enumerate(columns):
             max_w = get_display_width(col)
-            # 采样前 300 行计算宽度，平衡性能与准确性
             sample_size = min(len(data), 300)
             for row in data[:sample_size]:
                 val = str(row[i])
                 if val.startswith(">>> "): val = val[4:-4]
                 max_w = max(max_w, get_display_width(val))
-            # 增加 padding，并提高最大宽度至 600
-            self.col_widths[i] = min(max_w * 8 + 30, 600)
-
-        # 设置内部框架大小以撑开滚动条
-        total_width = sum(self.col_widths)
-        total_height = (len(data) + 1) * self.row_height
-        self.scrollable_frame.config(width=total_width, height=total_height)
-        self.canvas.config(scrollregion=(0, 0, total_width, total_height))
+            self.base_col_widths[i] = min(max_w * 8 + 30, 600)
         
+        # 初始列宽 = 基础宽度
+        self.col_widths = [int(w) for w in self.base_col_widths]
+
+        self._update_scroll_region()
         self._update_view()
 
+    def _get_row_y(self, row_idx):
+        """计算第 row_idx 行的起始 y 坐标"""
+        return sum(self.row_heights[:row_idx])
+
+    def _get_row_at_y(self, y_coord):
+        """根据 y 坐标查找所在的行索引"""
+        current_y = 0
+        for i, h in enumerate(self.row_heights):
+            if current_y <= y_coord < current_y + h:
+                return i
+            current_y += h
+        return len(self.row_heights) - 1
+
+    def _get_col_x(self, col_idx):
+        """计算第 col_idx 列的起始 x 坐标"""
+        return sum(self.col_widths[:col_idx])
+
+    def _get_col_at_x(self, x_coord):
+        """根据 x 坐标查找所在的列索引"""
+        current_x = 0
+        for i, w in enumerate(self.col_widths):
+            if current_x <= x_coord < current_x + w:
+                return i
+            current_x += w
+        return len(self.col_widths) - 1
+
+    def _update_scroll_region(self):
+        """更新滚动区域大小"""
+        if not self.data:
+            return
+        
+        total_width = sum(self.col_widths)
+        total_height = sum(self.row_heights)
+        self.scrollable_frame.config(width=total_width, height=total_height)
+        self.canvas.config(scrollregion=(0, 0, total_width, total_height))
+
+    def _on_cell_click(self, event, row_idx, col_idx):
+        """单元格点击事件"""
+        self.selected_cell = (row_idx, col_idx)
+        self._update_view()
+        if hasattr(self, 'on_select_callback'):
+            self.on_select_callback(row_idx, col_idx)
+
     def _update_view(self):
-        """核心：虚拟化渲染，只创建/显示可见区域的控件"""
+        """核心：虚拟化渲染，支持自由冻结和个别行列调整"""
         if not self.data:
             return
 
-        # 获取当前视图范围
-        v_start = self.canvas.yview()[0]
-        v_end = self.canvas.yview()[1]
-        h_start = self.canvas.xview()[0]
-        h_end = self.canvas.xview()[1]
-
-        total_rows = len(self.data)
-        total_height = (total_rows + 1) * self.row_height
+        # 获取滚动偏移（像素）
+        total_width = sum(self.col_widths)
+        total_height = sum(self.row_heights)
         
-        # 计算可见行范围
-        start_row = int(v_start * total_height / self.row_height) - 1
-        end_row = int(v_end * total_height / self.row_height) + 1
+        h_start_ratio = self.canvas.xview()[0]
+        v_start_ratio = self.canvas.yview()[0]
+        h_end_ratio = self.canvas.xview()[1]
+        v_end_ratio = self.canvas.yview()[1]
+        
+        x_offset = h_start_ratio * total_width
+        y_offset = v_start_ratio * total_height
+
+        # 计算可见行范围 (包含表头，表头是第 0 行)
+        start_row = self._get_row_at_y(y_offset)
+        end_row = self._get_row_at_y(v_end_ratio * total_height) + 1
         
         start_row = max(0, start_row)
-        end_row = min(total_rows, end_row)
+        end_row = min(len(self.data) + 1, end_row)
 
-        # 计算可见列范围 (水平虚拟化)
-        total_width = sum(self.col_widths)
-        start_col = 0
-        current_w = 0
-        for i, w in enumerate(self.col_widths):
-            if (current_w + w) / total_width < h_start:
-                start_col = i
-            if current_w / total_width > h_end:
-                end_col = i
-                break
-            current_w += w
-        else:
-            end_col = len(self.columns)
+        # 计算可见列范围
+        start_col = self._get_col_at_x(x_offset)
+        end_col = self._get_col_at_x(h_end_ratio * total_width) + 1
         
-        start_col = max(0, start_col - 1)
-        end_col = min(len(self.columns), end_col + 1)
+        start_col = max(0, start_col)
+        end_col = min(len(self.columns), end_col)
 
-        # 1. 处理表头 (始终可见，但水平位置随 hsb 移动)
-        # 清理不可见的表头
-        current_visible_headers = set(range(start_col, end_col))
-        for j in list(range(len(self.header_widgets))):
-            if j not in current_visible_headers and self.header_widgets[j]:
+        f_rows = self.freeze_rows.get()
+        f_cols = self.freeze_cols.get()
+
+        # 1. 处理表头 (行索引为 0)
+        cols_to_render_header = set(range(start_col, end_col))
+        for c in range(f_cols):
+            cols_to_render_header.add(c)
+            
+        for j in range(len(self.columns)):
+            if j in cols_to_render_header:
+                if self.header_widgets[j] is None:
+                    lbl = tk.Label(self.scrollable_frame, text=self.columns[j], 
+                                 font=('Arial', 10, 'bold'), bg='#F0F0F0',
+                                 borderwidth=1, relief="raised", padx=5)
+                    self._bind_mouse_wheel(lbl)
+                    lbl.bind("<Button-1>", lambda e, c=j: self._on_cell_click(e, 0, c))
+                    self.header_widgets[j] = lbl
+                
+                # 冻结位置计算
+                target_x = self._get_col_x(j)
+                target_y = 0
+                
+                if f_rows > 0:
+                    target_y = y_offset
+                if j < f_cols:
+                    target_x = x_offset + self._get_col_x(j)
+                
+                # 选中状态背景
+                bg_color = '#CCE8FF' if self.selected_cell == (0, j) else '#F0F0F0'
+                self.header_widgets[j].config(bg=bg_color)
+                
+                self.header_widgets[j].place(x=target_x, y=target_y, 
+                                           width=self.col_widths[j], height=self.row_heights[0])
+                if f_rows > 0 or j < f_cols:
+                    self.header_widgets[j].lift()
+            elif self.header_widgets[j] is not None:
                 self.header_widgets[j].destroy()
                 self.header_widgets[j] = None
-        
-        if not hasattr(self, 'header_widgets') or not self.header_widgets:
-            self.header_widgets = [None] * len(self.columns)
 
-        for j in current_visible_headers:
-            if self.header_widgets[j] is None:
-                lbl = tk.Label(self.scrollable_frame, text=self.columns[j], font=('Arial', 10, 'bold'),
-                             relief="raised", bg='#F0F0F0', padx=10, borderwidth=1)
-                lbl.place(x=sum(self.col_widths[:j]), y=0, width=self.col_widths[j], height=self.row_height)
-                self.header_widgets[j] = lbl
-
-        # 2. 处理数据行
+        # 2. 处理数据行 (数据行索引 i 从 0 开始，在 row_heights 中对应 i+1)
         current_visible_keys = set()
-        for i in range(start_row, end_row):
+        
+        rows_to_render = set(range(max(1, start_row), end_row))
+        for r in range(1, f_rows): # 冻结数据行
+            if r < len(self.row_heights):
+                rows_to_render.add(r)
+        
+        for r_idx in rows_to_render:
+            i = r_idx - 1 # 数据索引
             row_vals = self.data[i]
             tags = self.tags_list[i]
             status = row_vals[0] if row_vals else ""
             
-            for j in range(start_col, end_col):
+            cols_to_render = set(range(start_col, end_col))
+            for c in range(f_cols):
+                cols_to_render.add(c)
+
+            for j in cols_to_render:
                 val = row_vals[j]
                 key = (i, j)
                 current_visible_keys.add(key)
@@ -196,40 +280,58 @@ class ScrollableTable(tk.Frame):
                     cell_bg = "white"
                     fg_color = "black"
                     
-                    # 状态颜色填充
-                    if j == 0: # 状态列
-                        if status == "新增": cell_bg = '#CCFFCC' # 浅绿
-                        elif status == "删除": cell_bg = '#FFFFCC' # 浅黄
-                        elif status == "修改": cell_bg = '#E6F3FF' # 浅蓝
+                    if j == 0:
+                        if status == "新增": cell_bg = '#CCFFCC'
+                        elif status == "删除": cell_bg = '#FFFFCC'
+                        elif status == "修改": cell_bg = '#E6F3FF'
                         elif status == "一致": cell_bg = '#F8F8F8'
                     else:
-                        # 差异行背景
-                        if 'added' in tags: cell_bg = '#F0FFF0' # 极浅绿
-                        elif 'deleted' in tags: cell_bg = '#FFFFF0' # 极浅黄
+                        if 'added' in tags: cell_bg = '#F0FFF0'
+                        elif 'deleted' in tags: cell_bg = '#FFFFF0'
                     
-                    # 差异单元格高亮 (>>> <<<)
                     if val_str.startswith(">>> ") and val_str.endswith(" <<<"):
                         val_str = val_str[4:-4]
-                        cell_bg = '#FFCCCC' # 浅红色填充
-                        fg_color = '#CC0000' # 深红色文字
+                        cell_bg = '#FFCCCC'
+                        fg_color = '#CC0000'
                     
                     lbl = tk.Label(self.scrollable_frame, text=val_str, font=('Arial', 10),
-                                 bg=cell_bg, fg=fg_color, padx=10, 
+                                 bg=cell_bg, fg=fg_color, padx=5, 
                                  borderwidth=1, relief="groove", anchor="w")
-                    lbl.place(x=sum(self.col_widths[:j]), y=(i+1)*self.row_height, 
-                             width=self.col_widths[j], height=self.row_height)
                     self.cell_widgets[key] = lbl
                     self._bind_mouse_wheel(lbl)
+                    lbl.bind("<Button-1>", lambda e, r=r_idx, c=j: self._on_cell_click(e, r, c))
+                    lbl.original_bg = cell_bg
 
-        # 3. 清理不可见区域的控件以节省内存和提升性能
+                # 冻结位置计算
+                target_x = self._get_col_x(j)
+                target_y = self._get_row_y(r_idx)
+                
+                if r_idx < f_rows:
+                    target_y = y_offset + self._get_row_y(r_idx)
+                if j < f_cols:
+                    target_x = x_offset + self._get_col_x(j)
+                
+                # 选中状态高亮
+                if self.selected_cell == (r_idx, j):
+                    self.cell_widgets[key].config(bg='#CCE8FF')
+                else:
+                    self.cell_widgets[key].config(bg=self.cell_widgets[key].original_bg)
+                
+                self.cell_widgets[key].place(x=target_x, y=target_y, 
+                                           width=self.col_widths[j], height=self.row_heights[r_idx])
+                if r_idx < f_rows or j < f_cols:
+                    self.cell_widgets[key].lift()
+
+        # 3. 清理
         to_remove = []
         for key in self.cell_widgets:
             if key not in current_visible_keys:
-                # 范围判定：行列都要考虑
-                r_idx, c_idx = key
-                if (r_idx < start_row - 5 or r_idx > end_row + 5 or 
-                    c_idx < start_col - 2 or c_idx > end_col + 2):
-                    to_remove.append(key)
+                i_idx, c_idx = key
+                r_idx = i_idx + 1
+                if (r_idx < start_row - 10 or r_idx > end_row + 10 or 
+                    c_idx < start_col - 5 or c_idx > end_col + 5):
+                    if not (r_idx < f_rows or c_idx < f_cols):
+                        to_remove.append(key)
         
         for key in to_remove:
             self.cell_widgets[key].destroy()
@@ -293,6 +395,14 @@ class ExcelComparatorApp:
         self.df1 = None
         self.df2 = None
 
+        # 界面控制变量
+        self.freeze_rows = tk.IntVar(value=1)
+        self.freeze_cols = tk.IntVar(value=1)
+        self.row_h_var = tk.DoubleVar(value=30)
+        self.col_w_var = tk.DoubleVar(value=1.0)
+        self.sel_row_h = tk.IntVar(value=30)
+        self.sel_col_w = tk.IntVar(value=100)
+
         # 样式设置
         self.style = ttk.Style()
         self.style.configure("Treeview.Heading", font=('Arial', 10, 'bold'))
@@ -340,14 +450,14 @@ Excel 差异比对工具 使用说明：
 
     def show_version(self):
         """显示版本说明"""
-        version = "V1.1.1"
+        version = "V1.3.0"
         try:
             if os.path.exists("updates_notes.txt"):
                 with open("updates_notes.txt", "r", encoding="utf-8") as f:
-                    content = f.read()
-                    first_line = content.split('\n')[0]
-                    if "版本:" in first_line:
-                        version = first_line.split(":")[1].strip()
+                    first_line = f.readline().strip()
+                    if first_line.startswith('V'):
+                        # 格式：V1.2.0 2025-12-26 -> 提取 V1.2.0
+                        version = first_line.split(' ')[0]
         except Exception:
             pass
             
@@ -357,19 +467,37 @@ Excel 差异比对工具
 当前版本：{version}
 更新日期：2025-12-26
 
-主要功能：
-- 支持多 Sheet 选择比对
-- 单元格级差异精准识别与高亮
-- 支持合并单元格自动填充处理
-- 左右同步滚动与虚拟化渲染
-- 支持导出高亮标记的 Excel 结果
+更新亮点：
+- 智能行对齐算法：支持识别中间插入行和删除行，比对更精准
+- 表格冻结功能：支持首行首列冻结，方便大数据量查看
+- 单元格大小调整：支持 50% - 200% 的比例缩放
+- 性能优化：支持大数据量虚拟化滚动
 """
         messagebox.showinfo("版本说明", version_text)
 
     def create_widgets(self):
-        # 顶部控制面板
+        # 1. 结果展示区域 (双栏显示) - 先创建表格
+        result_main_frame = ttk.Frame(self.root, padding=10)
+        result_main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        self.paned = ttk.PanedWindow(result_main_frame, orient=tk.HORIZONTAL)
+        self.paned.pack(fill=tk.BOTH, expand=True)
+
+        self.left_frame = ttk.LabelFrame(self.paned, text="文件 1 (旧)")
+        self.paned.add(self.left_frame, weight=1)
+        self.table_left = ScrollableTable(self.left_frame)
+        self.table_left.pack(fill=tk.BOTH, expand=True)
+        self.table_left.on_select_callback = lambda r, c: self.on_cell_selected(r, c, source="left")
+        
+        self.right_frame = ttk.LabelFrame(self.paned, text="文件 2 (新)")
+        self.paned.add(self.right_frame, weight=1)
+        self.table_right = ScrollableTable(self.right_frame)
+        self.table_right.pack(fill=tk.BOTH, expand=True)
+        self.table_right.on_select_callback = lambda r, c: self.on_cell_selected(r, c, source="right")
+
+        # 2. 顶部控制面板
         control_frame = ttk.LabelFrame(self.root, text="文件选择与设置", padding=10)
-        control_frame.pack(fill=tk.X, padx=10, pady=5)
+        control_frame.pack(fill=tk.X, padx=10, pady=5, before=result_main_frame) # 放在结果区域上方
 
         # 文件 1 选择区域 (使用蓝色系背景)
         f1_frame = tk.Frame(control_frame, bg='#E6F3FF', padx=5, pady=5)
@@ -395,54 +523,94 @@ Excel 差异比对工具
         self.sheet_combo2 = ttk.Combobox(f2_frame, state="readonly", width=20)
         self.sheet_combo2.grid(row=0, column=4)
 
-        # 比对按钮控制区
-        action_frame = ttk.Frame(self.root, padding=5)
-        action_frame.pack(fill=tk.X, padx=10)
-        
-        self.btn_compare_ref = ttk.Button(action_frame, text="开始比对", command=self.compare_files)
-        self.btn_compare_ref.pack(side=tk.LEFT)
-        
-        # 导出按钮 (默认禁用)
-        self.btn_export = ttk.Button(action_frame, text="导出比对结果", command=self.export_results, state=tk.DISABLED)
-        self.btn_export.pack(side=tk.LEFT, padx=10)
-        
-        # 垂直滚动同步选项
-        ttk.Checkbutton(action_frame, text="垂直滚动同步", variable=self.sync_v_scroll).pack(side=tk.LEFT, padx=10)
-        
-        # 左右滚动同步选项
-        ttk.Checkbutton(action_frame, text="左右滚动同步", variable=self.sync_h_scroll).pack(side=tk.LEFT, padx=10)
-        
-        # 添加图例
-        legend_frame = ttk.Frame(action_frame)
-        legend_frame.pack(side=tk.LEFT, padx=20)
-        
-        ttk.Label(legend_frame, text="状态图例: ").pack(side=tk.LEFT)
-        ttk.Label(legend_frame, text=" 修改 ", background='#E6F3FF').pack(side=tk.LEFT, padx=2)
-        ttk.Label(legend_frame, text=" 新增 ", background='#CCFFCC').pack(side=tk.LEFT, padx=2)
-        ttk.Label(legend_frame, text=" 删除 ", background='#FFFFCC').pack(side=tk.LEFT, padx=2)
-        ttk.Label(legend_frame, text=" | 单元格差异: >>> <<< ", background='#FFCCCC', foreground='#CC0000').pack(side=tk.LEFT, padx=(10, 2))
+        # 底部控制区容器
+        bottom_frame = ttk.Frame(self.root, padding=5)
+        bottom_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        # 结果展示区域 (双栏显示)
-        result_main_frame = ttk.Frame(self.root, padding=10)
-        result_main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        # 1. 核心操作区 (左侧)
+        action_group = ttk.LabelFrame(bottom_frame, text="操作控制", padding=5)
+        action_group.pack(side=tk.LEFT, fill=tk.Y, padx=5)
+        
+        self.btn_compare_ref = ttk.Button(action_group, text="开始比对", command=self.compare_files, width=12)
+        self.btn_compare_ref.pack(side=tk.LEFT, padx=5)
+        
+        self.btn_export = ttk.Button(action_group, text="导出结果", command=self.export_results, state=tk.DISABLED, width=12)
+        self.btn_export.pack(side=tk.LEFT, padx=5)
+        
+        sync_frame = ttk.Frame(action_group)
+        sync_frame.pack(side=tk.LEFT, padx=10)
+        ttk.Checkbutton(sync_frame, text="同步纵滚", variable=self.sync_v_scroll).pack(side=tk.TOP, anchor=tk.W)
+        ttk.Checkbutton(sync_frame, text="同步横滚", variable=self.sync_h_scroll).pack(side=tk.TOP, anchor=tk.W)
 
-        # 使用 PanedWindow 允许调整左右占比
-        self.paned = ttk.PanedWindow(result_main_frame, orient=tk.HORIZONTAL)
-        self.paned.pack(fill=tk.BOTH, expand=True)
+        # 2. 显示设置区 (中间)
+        display_group = ttk.LabelFrame(bottom_frame, text="显示设置", padding=5)
+        display_group.pack(side=tk.LEFT, fill=tk.Y, padx=5)
+        
+        # 冻结设置
+        freeze_f = ttk.Frame(display_group)
+        freeze_f.pack(side=tk.LEFT, padx=5)
+        
+        f_row_f = ttk.Frame(freeze_f)
+        f_row_f.pack(fill=tk.X)
+        ttk.Label(f_row_f, text="冻结行:").pack(side=tk.LEFT)
+        tk.Spinbox(f_row_f, from_=0, to=50, textvariable=self.freeze_rows, width=3).pack(side=tk.LEFT, padx=2)
+        self.freeze_rows.trace_add("write", self.sync_freeze_rows)
 
-        # 左侧表格 (文件 1)
-        self.left_frame = ttk.LabelFrame(self.paned, text="文件 1 (旧)")
-        self.paned.add(self.left_frame, weight=1)
+        f_col_f = ttk.Frame(freeze_f)
+        f_col_f.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(f_col_f, text="冻结列:").pack(side=tk.LEFT)
+        tk.Spinbox(f_col_f, from_=0, to=20, textvariable=self.freeze_cols, width=3).pack(side=tk.LEFT, padx=2)
+        self.freeze_cols.trace_add("write", self.sync_freeze_cols)
+
+        # 尺寸滑块
+        slider_f = ttk.Frame(display_group)
+        slider_f.pack(side=tk.LEFT, padx=10)
         
-        self.table_left = ScrollableTable(self.left_frame)
-        self.table_left.pack(fill=tk.BOTH, expand=True)
+        h_f = ttk.Frame(slider_f)
+        h_f.pack(fill=tk.X)
+        ttk.Label(h_f, text="行高:").pack(side=tk.LEFT)
+        ttk.Scale(h_f, from_=20, to=100, variable=self.row_h_var, orient=tk.HORIZONTAL, length=80, command=self.on_row_height_change).pack(side=tk.LEFT, padx=5)
+        self.row_height_label = ttk.Label(h_f, text="30px", width=5)
+        self.row_height_label.pack(side=tk.LEFT)
+
+        w_f = ttk.Frame(slider_f)
+        w_f.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(w_f, text="列宽:").pack(side=tk.LEFT)
+        ttk.Scale(w_f, from_=0.5, to=3.0, variable=self.col_w_var, orient=tk.HORIZONTAL, length=80, command=self.on_col_width_change).pack(side=tk.LEFT, padx=5)
+        self.col_width_label = ttk.Label(w_f, text="100%", width=5)
+        self.col_width_label.pack(side=tk.LEFT)
+
+        # 3. 选中调整区 (右侧)
+        selection_group = ttk.LabelFrame(bottom_frame, text="选中项精调", padding=5)
+        selection_group.pack(side=tk.LEFT, fill=tk.Y, padx=5)
         
-        # 右侧表格 (文件 2)
-        self.right_frame = ttk.LabelFrame(self.paned, text="文件 2 (新)")
-        self.paned.add(self.right_frame, weight=1)
+        sel_h_f = ttk.Frame(selection_group)
+        sel_h_f.pack(fill=tk.X)
+        ttk.Label(sel_h_f, text="选中行高:").pack(side=tk.LEFT)
+        self.sel_row_spin = tk.Spinbox(sel_h_f, from_=10, to=500, textvariable=self.sel_row_h, width=5)
+        self.sel_row_spin.pack(side=tk.LEFT, padx=5)
+        self.sel_row_h.trace_add("write", lambda *args: self.adjust_selected_row_height())
         
-        self.table_right = ScrollableTable(self.right_frame)
-        self.table_right.pack(fill=tk.BOTH, expand=True)
+        sel_w_f = ttk.Frame(selection_group)
+        sel_w_f.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(sel_w_f, text="选中列宽:").pack(side=tk.LEFT)
+        self.sel_col_spin = tk.Spinbox(sel_w_f, from_=10, to=1000, textvariable=self.sel_col_w, width=5)
+        self.sel_col_spin.pack(side=tk.LEFT, padx=5)
+        self.sel_col_w.trace_add("write", lambda *args: self.adjust_selected_col_width())
+
+        # 4. 图例区 (最右侧)
+        legend_group = ttk.LabelFrame(bottom_frame, text="图例说明", padding=5)
+        legend_group.pack(side=tk.LEFT, fill=tk.Y, padx=5, expand=True)
+        
+        l_row1 = ttk.Frame(legend_group)
+        l_row1.pack(fill=tk.X)
+        ttk.Label(l_row1, text="修改", background='#E6F3FF', width=6, anchor=tk.CENTER).pack(side=tk.LEFT, padx=2)
+        ttk.Label(l_row1, text="新增", background='#CCFFCC', width=6, anchor=tk.CENTER).pack(side=tk.LEFT, padx=2)
+        ttk.Label(l_row1, text="删除", background='#FFFFCC', width=6, anchor=tk.CENTER).pack(side=tk.LEFT, padx=2)
+        
+        l_row2 = ttk.Frame(legend_group)
+        l_row2.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(l_row2, text="单元格差异: >>>内容<<<", background='#FFCCCC', foreground='#CC0000', font=('Arial', 8)).pack(side=tk.LEFT, padx=2)
 
         # 绑定同步滚动逻辑
         self.table_left.canvas.bind("<Configure>", lambda e: self.sync_scroll_setup())
@@ -458,6 +626,55 @@ Excel 差异比对工具
         self.table_right.canvas.configure(yscrollcommand=lambda *args: self.sync_scroll_y(self.table_right, *args))
         self.table_left.canvas.configure(xscrollcommand=lambda *args: self.sync_scroll_x(self.table_left, *args))
         self.table_right.canvas.configure(xscrollcommand=lambda *args: self.sync_scroll_x(self.table_right, *args))
+
+    def on_cell_selected(self, row_idx, col_idx, source="left"):
+        """处理单元格选中事件"""
+        target_table = self.table_right if source == "left" else self.table_left
+        source_table = self.table_left if source == "left" else self.table_right
+        
+        # 同步选中状态
+        target_table.selected_cell = (row_idx, col_idx)
+        target_table._update_view()
+        
+        # 更新调整控件的值
+        self.sel_row_h.set(source_table.row_heights[row_idx])
+        self.sel_col_w.set(source_table.col_widths[col_idx])
+
+    def adjust_selected_row_height(self):
+        """调整选中行的高度"""
+        if not self.table_left.data: return
+        
+        row_idx = self.table_left.selected_cell[0] if self.table_left.selected_cell else None
+        if row_idx is None:
+            row_idx = self.table_right.selected_cell[0] if self.table_right.selected_cell else None
+        
+        if row_idx is not None:
+            try:
+                new_h = int(self.sel_row_h.get())
+                if 10 <= new_h <= 500:
+                    self.table_left.row_heights[row_idx] = new_h
+                    self.table_right.row_heights[row_idx] = new_h
+                    self.update_tables_view()
+            except (ValueError, tk.TclError):
+                pass
+
+    def adjust_selected_col_width(self):
+        """调整选中列的宽度"""
+        if not self.table_left.data: return
+        
+        col_idx = self.table_left.selected_cell[1] if self.table_left.selected_cell else None
+        if col_idx is None:
+            col_idx = self.table_right.selected_cell[1] if self.table_right.selected_cell else None
+            
+        if col_idx is not None:
+            try:
+                new_w = int(self.sel_col_w.get())
+                if 10 <= new_w <= 1000:
+                    self.table_left.col_widths[col_idx] = new_w
+                    self.table_right.col_widths[col_idx] = new_w
+                    self.update_tables_view()
+            except (ValueError, tk.TclError):
+                pass
 
     def sync_scroll_y(self, source_table, *args):
         """同步垂直滚动"""
@@ -498,6 +715,54 @@ Excel 差异比对工具
                 target_table._update_view()
         finally:
             self._scrolling = False
+
+    def sync_freeze_rows(self, *args):
+        """同步左右表格的冻结行设置"""
+        val = self.freeze_rows.get()
+        self.table_left.freeze_rows.set(val)
+        self.table_right.freeze_rows.set(val)
+        self.update_tables_view()
+
+    def sync_freeze_cols(self, *args):
+        """同步左右表格的冻结列设置"""
+        val = self.freeze_cols.get()
+        self.table_left.freeze_cols.set(val)
+        self.table_right.freeze_cols.set(val)
+        self.update_tables_view()
+
+    def on_row_height_change(self, value):
+        """行高改变"""
+        h = int(float(value))
+        self.row_height_label.config(text=f"{h}px")
+        
+        # 更新所有行的基础行高
+        if hasattr(self.table_left, 'row_heights') and self.table_left.row_heights:
+            self.table_left.row_heights = [h] * len(self.table_left.row_heights)
+            self.table_right.row_heights = [h] * len(self.table_right.row_heights)
+            
+        self.table_left.row_height = h
+        self.table_right.row_height = h
+        self.update_tables_view()
+
+    def on_col_width_change(self, value):
+        """全局列宽缩放改变"""
+        factor = float(value)
+        self.col_width_label.config(text=f"{int(factor * 100)}%")
+        
+        # 基于原始基础宽度进行缩放
+        if hasattr(self.table_left, 'base_col_widths') and self.table_left.base_col_widths:
+            self.table_left.col_widths = [int(w * factor) for w in self.table_left.base_col_widths]
+            self.table_right.col_widths = [int(w * factor) for w in self.table_right.base_col_widths]
+            self.update_tables_view()
+
+    def update_tables_view(self):
+        """更新左右表格的视图"""
+        # 更新滚动区域
+        self.table_left._update_scroll_region()
+        self.table_right._update_scroll_region()
+        # 强制重新渲染可见区域
+        self.table_left._update_view()
+        self.table_right._update_view()
 
     def browse_file(self, file_num):
         filename = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])

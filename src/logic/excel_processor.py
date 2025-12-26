@@ -1,5 +1,6 @@
 import pandas as pd
 import openpyxl
+import difflib
 from openpyxl.utils import range_boundaries
 from openpyxl.styles import PatternFill, Font, Alignment
 
@@ -59,94 +60,105 @@ class ExcelDiffer:
     @staticmethod
     def compare_dataframes(df1, df2):
         """
-        比对两个 DataFrame，返回比对结果列表。
+        比对两个 DataFrame，使用序列对齐算法识别增、删、改。
         返回格式: (all_columns, results)
-        results 列表中的每个元素是一个包含 (left_values, right_values, tags) 的元组。
         """
-        # 填充缺失值为特定字符串，防止 NaN 比较问题
+        # 填充缺失值为特定字符串
         df1 = df1.fillna("")
         df2 = df2.fillna("")
         
-        results = []
-        
-        # 获取所有列的并集，并保持原始顺序（优先 df1）
+        # 获取所有列的并集
         all_columns = ["状态"] + list(df1.columns)
         for col in df2.columns:
             if col not in all_columns:
                 all_columns.append(col)
-        
-        # 数据列（不含状态列）
         data_columns = all_columns[1:]
-        
-        # 获取最大行数
-        max_rows = max(len(df1), len(df2))
-        
-        for i in range(max_rows):
-            left_values = []
-            right_values = []
-            tags = []
-            
-            # 检查行是否存在
-            in_df1 = i < len(df1)
-            in_df2 = i < len(df2)
 
-            if not in_df1:
-                # df1 中没有，df2 中有 (新增行)
-                row_data = df2.iloc[i]
-                status = "新增"
-                left_values = [status] + ["" for _ in data_columns]
-                right_values = [status] + [f"{row_data.get(col, '')}" if col in df2.columns else "" for col in data_columns]
-                tags.append('added')
-            elif not in_df2:
-                # df1 中有，df2 中没有 (删除行)
-                row_data = df1.iloc[i]
-                status = "删除"
-                left_values = [status] + [f"{row_data.get(col, '')}" if col in df1.columns else "" for col in data_columns]
-                right_values = [status] + ["" for _ in data_columns]
-                tags.append('deleted')
-            else:
-                # 两边都有，逐个单元格比较
-                row1 = df1.iloc[i]
-                row2 = df2.iloc[i]
-                has_diff = False
-                l_row = []
-                r_row = []
-                
-                for col in data_columns:
-                    val1 = ""
-                    val2 = ""
-                    
-                    if col in df1.columns:
-                        val1 = row1[col]
-                    if col in df2.columns:
-                        val2 = row2[col]
-                    
-                    # 尝试转换类型比较，避免 int vs float vs str 的问题
-                    v1_str = str(val1).strip()
-                    v2_str = str(val2).strip()
-
-                    if v1_str != v2_str:
-                        # 使用更醒目的标记方式： >>> 内容 <<<
-                        l_row.append(f">>> {val1} <<<")
-                        r_row.append(f">>> {val2} <<<")
-                        has_diff = True
-                    else:
-                        l_row.append(f"{val1}")
-                        r_row.append(f"{val2}")
-                
-                if has_diff:
-                    status = "修改"
-                    tags.append('modified')
-                else:
-                    status = "一致"
-                    tags.append('equal')
-                
-                left_values = [status] + l_row
-                right_values = [status] + r_row
+        # 将 DataFrame 转换为字符串列表进行序列比对
+        # 每一行转为 tuple 以便 SequenceMatcher 比较
+        rows1 = [tuple(row) for row in df1.values]
+        rows2 = [tuple(row) for row in df2.values]
+        
+        matcher = difflib.SequenceMatcher(None, rows1, rows2)
+        results = []
+        
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'equal':
+                # 行完全一致
+                for k in range(i2 - i1):
+                    row = df1.iloc[i1 + k]
+                    vals = [row.get(col, "") for col in data_columns]
+                    results.append((["一致"] + vals, ["一致"] + vals, ['equal']))
             
-            results.append((left_values, right_values, tags))
+            elif tag == 'replace':
+                # 行发生了修改（或由于对齐算法认为这是替换）
+                # 我们需要尝试逐行比对
+                # 由于 replace 范围可能不对等，我们需要小心处理
+                count1 = i2 - i1
+                count2 = j2 - j1
+                max_count = max(count1, count2)
+                
+                for k in range(max_count):
+                    has_row1 = k < count1
+                    has_row2 = k < count2
+                    
+                    if has_row1 and has_row2:
+                        # 逐单元格比较
+                        row1 = df1.iloc[i1 + k]
+                        row2 = df2.iloc[j1 + k]
+                        l_row, r_row, has_diff = ExcelDiffer._compare_rows(row1, row2, data_columns)
+                        status = "修改" if has_diff else "一致"
+                        results.append(([status] + l_row, [status] + r_row, ['modified' if has_diff else 'equal']))
+                    elif has_row1:
+                        # 删除行
+                        row1 = df1.iloc[i1 + k]
+                        vals = [row1.get(col, "") for col in data_columns]
+                        results.append((["删除"] + vals, ["删除"] + ["" for _ in data_columns], ['deleted']))
+                    elif has_row2:
+                        # 新增行
+                        row2 = df2.iloc[j1 + k]
+                        vals = [row2.get(col, "") for col in data_columns]
+                        results.append((["新增"] + ["" for _ in data_columns], ["新增"] + vals, ['added']))
             
+            elif tag == 'delete':
+                # 明确的删除
+                for k in range(i1, i2):
+                    row = df1.iloc[k]
+                    vals = [row.get(col, "") for col in data_columns]
+                    results.append((["删除"] + vals, ["删除"] + ["" for _ in data_columns], ['deleted']))
+            
+            elif tag == 'insert':
+                # 明确的新增
+                for k in range(j1, j2):
+                    row = df2.iloc[k]
+                    vals = [row.get(col, "") for col in data_columns]
+                    results.append((["新增"] + ["" for _ in data_columns], ["新增"] + vals, ['added']))
+                    
         return all_columns, results
+
+    @staticmethod
+    def _compare_rows(row1, row2, columns):
+        """内部方法：比对两行数据并标记差异"""
+        l_row = []
+        r_row = []
+        has_diff = False
+        
+        for col in columns:
+            val1 = row1.get(col, "")
+            val2 = row2.get(col, "")
+            
+            v1_str = str(val1).strip()
+            v2_str = str(val2).strip()
+            
+            if v1_str != v2_str:
+                l_row.append(f">>> {val1} <<<")
+                r_row.append(f">>> {val2} <<<")
+                has_diff = True
+            else:
+                l_row.append(str(val1))
+                r_row.append(str(val2))
+        return l_row, r_row, has_diff
+
 
     @staticmethod
     def export_diff(output_path, columns, results):
