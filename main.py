@@ -9,14 +9,14 @@ def set_app_user_model_id():
     """设置 Windows 任务栏图标 AppUserModelID"""
     try:
         # 格式：公司名.产品名.子模块.版本号
-        myappid = 'ExcelCompareTool.Main.V1_0_2' 
+        myappid = 'ExcelCompareTool.Main.V1_1_1' 
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     except Exception:
         pass
 
 def get_version():
     """从 updates_notes.txt 中读取最新版本号"""
-    version = "V1.0.2"
+    version = "V1.1.1"
     try:
         if os.path.exists("updates_notes.txt"):
             with open("updates_notes.txt", "r", encoding="utf-8") as f:

@@ -1,6 +1,7 @@
 import pandas as pd
 import openpyxl
 from openpyxl.utils import range_boundaries
+from openpyxl.styles import PatternFill, Font, Alignment
 
 class ExcelDiffer:
     """Excel 比对逻辑处理类"""
@@ -125,8 +126,9 @@ class ExcelDiffer:
                     v2_str = str(val2).strip()
 
                     if v1_str != v2_str:
-                        l_row.append(f"【{val1}】")
-                        r_row.append(f"【{val2}】")
+                        # 使用更醒目的标记方式： >>> 内容 <<<
+                        l_row.append(f">>> {val1} <<<")
+                        r_row.append(f">>> {val2} <<<")
                         has_diff = True
                     else:
                         l_row.append(f"{val1}")
@@ -145,3 +147,83 @@ class ExcelDiffer:
             results.append((left_values, right_values, tags))
             
         return all_columns, results
+
+    @staticmethod
+    def export_diff(output_path, columns, results):
+        """将比对结果导出到 Excel，并应用单元格级别的高亮"""
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "比对结果"
+
+        # 定义样式
+        header_fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
+        modified_fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
+        added_fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
+        deleted_fill = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")
+        bold_font = Font(bold=True)
+        center_align = Alignment(horizontal='center', vertical='center')
+
+        # 写入表头 (左右两部分)
+        half_cols = len(columns)
+        for i, col in enumerate(columns):
+            # 左侧表头
+            cell_l = ws.cell(row=1, column=i+1, value=f"文件1_{col}")
+            cell_l.fill = header_fill
+            cell_l.font = bold_font
+            # 右侧表头
+            cell_r = ws.cell(row=1, column=i+half_cols+2, value=f"文件2_{col}")
+            cell_r.fill = header_fill
+            cell_r.font = bold_font
+
+        # 写入数据并设置高亮
+        for row_idx, (left_vals, right_vals, tags) in enumerate(results):
+            excel_row = row_idx + 2
+            
+            # 处理左侧数据
+            for col_idx, val in enumerate(left_vals):
+                val_str = str(val)
+                actual_val = val
+                is_diff = False
+                
+                if val_str.startswith(">>> ") and val_str.endswith(" <<<"):
+                    actual_val = val_str[4:-4]
+                    is_diff = True
+                
+                cell = ws.cell(row=excel_row, column=col_idx+1, value=actual_val)
+                
+                if 'deleted' in tags:
+                    cell.fill = deleted_fill
+                elif is_diff:
+                    cell.fill = modified_fill
+
+            # 处理右侧数据
+            for col_idx, val in enumerate(right_vals):
+                val_str = str(val)
+                actual_val = val
+                is_diff = False
+                
+                if val_str.startswith(">>> ") and val_str.endswith(" <<<"):
+                    actual_val = val_str[4:-4]
+                    is_diff = True
+                
+                cell = ws.cell(row=excel_row, column=col_idx+half_cols+2, value=actual_val)
+                
+                if 'added' in tags:
+                    cell.fill = added_fill
+                elif is_diff:
+                    cell.fill = modified_fill
+
+        # 自动调整列宽
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = (max_length + 2)
+            ws.column_dimensions[column].width = min(adjusted_width, 50)
+
+        wb.save(output_path)
