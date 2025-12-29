@@ -1,2 +1,5 @@
 pandas
 openpyxl
+ttkbootstrap
+windnd
+Pillow

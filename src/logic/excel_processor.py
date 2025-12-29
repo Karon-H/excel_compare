@@ -58,9 +58,11 @@ class ExcelDiffer:
         return df
 
     @staticmethod
-    def compare_dataframes(df1, df2):
+    def compare_dataframes(df1, df2, key_columns=None):
         """
-        比对两个 DataFrame，使用序列对齐算法识别增、删、改。
+        比对两个 DataFrame。
+        - 如果 key_columns 为空，使用序列对齐算法 (difflib.SequenceMatcher)。
+        - 如果 key_columns 不为空，使用主键比对算法。
         返回格式: (all_columns, results)
         """
         # 填充缺失值为特定字符串
@@ -74,8 +76,15 @@ class ExcelDiffer:
                 all_columns.append(col)
         data_columns = all_columns[1:]
 
+        if not key_columns:
+            return ExcelDiffer._compare_by_sequence(df1, df2, data_columns, all_columns)
+        else:
+            return ExcelDiffer._compare_by_keys(df1, df2, key_columns, data_columns, all_columns)
+
+    @staticmethod
+    def _compare_by_sequence(df1, df2, data_columns, all_columns):
+        """原有的基于序列对齐的比对逻辑"""
         # 将 DataFrame 转换为字符串列表进行序列比对
-        # 每一行转为 tuple 以便 SequenceMatcher 比较
         rows1 = [tuple(row) for row in df1.values]
         rows2 = [tuple(row) for row in df2.values]
         
@@ -84,56 +93,92 @@ class ExcelDiffer:
         
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag == 'equal':
-                # 行完全一致
                 for k in range(i2 - i1):
                     row = df1.iloc[i1 + k]
                     vals = [row.get(col, "") for col in data_columns]
                     results.append((["一致"] + vals, ["一致"] + vals, ['equal']))
             
             elif tag == 'replace':
-                # 行发生了修改（或由于对齐算法认为这是替换）
-                # 我们需要尝试逐行比对
-                # 由于 replace 范围可能不对等，我们需要小心处理
                 count1 = i2 - i1
                 count2 = j2 - j1
                 max_count = max(count1, count2)
-                
                 for k in range(max_count):
                     has_row1 = k < count1
                     has_row2 = k < count2
-                    
                     if has_row1 and has_row2:
-                        # 逐单元格比较
                         row1 = df1.iloc[i1 + k]
                         row2 = df2.iloc[j1 + k]
                         l_row, r_row, has_diff = ExcelDiffer._compare_rows(row1, row2, data_columns)
                         status = "修改" if has_diff else "一致"
                         results.append(([status] + l_row, [status] + r_row, ['modified' if has_diff else 'equal']))
                     elif has_row1:
-                        # 删除行
                         row1 = df1.iloc[i1 + k]
                         vals = [row1.get(col, "") for col in data_columns]
                         results.append((["删除"] + vals, ["删除"] + ["" for _ in data_columns], ['deleted']))
                     elif has_row2:
-                        # 新增行
                         row2 = df2.iloc[j1 + k]
                         vals = [row2.get(col, "") for col in data_columns]
                         results.append((["新增"] + ["" for _ in data_columns], ["新增"] + vals, ['added']))
             
             elif tag == 'delete':
-                # 明确的删除
                 for k in range(i1, i2):
                     row = df1.iloc[k]
                     vals = [row.get(col, "") for col in data_columns]
                     results.append((["删除"] + vals, ["删除"] + ["" for _ in data_columns], ['deleted']))
             
             elif tag == 'insert':
-                # 明确的新增
                 for k in range(j1, j2):
                     row = df2.iloc[k]
                     vals = [row.get(col, "") for col in data_columns]
                     results.append((["新增"] + ["" for _ in data_columns], ["新增"] + vals, ['added']))
                     
+        return all_columns, results
+
+    @staticmethod
+    def _compare_by_keys(df1, df2, key_columns, data_columns, all_columns):
+        """基于关键列的主键比对逻辑"""
+        # 1. 为两个 DF 创建索引字典
+        def get_key(row, keys):
+            return tuple(str(row.get(k, "")) for k in keys)
+
+        dict1 = {get_key(row, key_columns): row for _, row in df1.iterrows()}
+        dict2 = {get_key(row, key_columns): row for _, row in df2.iterrows()}
+        
+        # 2. 获取所有的 Key 集合，并保持一定的顺序（以文件2为主，结合文件1）
+        all_keys = []
+        keys1 = list(dict1.keys())
+        keys2 = list(dict2.keys())
+        
+        # 简单的合并策略：先按文件1的顺序放，再放文件2中新增的
+        all_keys = keys1.copy()
+        set_keys1 = set(keys1)
+        for k in keys2:
+            if k not in set_keys1:
+                all_keys.append(k)
+        
+        results = []
+        for k in all_keys:
+            in_1 = k in dict1
+            in_2 = k in dict2
+            
+            if in_1 and in_2:
+                # 匹配到主键，比对内容
+                row1 = dict1[k]
+                row2 = dict2[k]
+                l_row, r_row, has_diff = ExcelDiffer._compare_rows(row1, row2, data_columns)
+                status = "修改" if has_diff else "一致"
+                results.append(([status] + l_row, [status] + r_row, ['modified' if has_diff else 'equal']))
+            elif in_1:
+                # 只有文件1有 -> 删除
+                row1 = dict1[k]
+                vals = [row1.get(col, "") for col in data_columns]
+                results.append((["删除"] + vals, ["删除"] + ["" for _ in data_columns], ['deleted']))
+            elif in_2:
+                # 只有文件2有 -> 新增
+                row2 = dict2[k]
+                vals = [row2.get(col, "") for col in data_columns]
+                results.append((["新增"] + ["" for _ in data_columns], ["新增"] + vals, ['added']))
+                
         return all_columns, results
 
     @staticmethod
