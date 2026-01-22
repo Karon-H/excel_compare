@@ -1,1104 +1,751 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox
-import ttkbootstrap as ttk
-from ttkbootstrap.constants import *
-from ttkbootstrap.dialogs import MessageDialog
-import pandas as pd
 import os
-import sys
-import ctypes
-import threading
-import windnd
-from PIL import Image, ImageTk
+from PyQt5 import QtWidgets, QtCore, QtGui
 from src.logic.excel_processor import ExcelDiffer
+from src.ui.frozen_table_view import FrozenTableView
 
-class ScrollableTable(tk.Frame):
-    """自定义的可滚动表格组件，支持单元格级高亮和虚拟化渲染（优化性能）"""
-    def __init__(self, parent, **kwargs):
-        super().__init__(parent, **kwargs)
-        
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
-        
-        self.canvas = tk.Canvas(self, bg='white', highlightthickness=0)
-        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self._on_vscroll)
-        self.hsb = ttk.Scrollbar(self, orient="horizontal", command=self._on_hscroll)
-        
-        # 内部容器：实际上不放所有数据，只用于撑开滚动条
-        self.scrollable_frame = tk.Frame(self.canvas, bg='white')
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        
-        self.canvas.configure(yscrollcommand=self.vsb.set, xscrollcommand=self.hsb.set)
 
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.vsb.grid(row=0, column=1, sticky="ns")
-        self.hsb.grid(row=1, column=0, sticky="ew")
-        
-        # 数据存储
-        self.columns = []
-        self.data = []
-        self.tags_list = []
-        self.base_row_height = 30
-        self.row_height = 30
-        self.row_heights = [] # 新增：记录每行的高度
+class CompareWorker(QtCore.QObject):
+    progress = QtCore.pyqtSignal(int, str)
+    finished = QtCore.pyqtSignal(list, list)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, file1, file2, sheet1, sheet2, key_cols):
+        super().__init__()
+        self.file1 = file1
+        self.file2 = file2
+        self.sheet1 = sheet1
+        self.sheet2 = sheet2
+        self.key_cols = key_cols
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            self.progress.emit(10, "正在读取文件 1...")
+            df1 = ExcelDiffer.read_excel_raw(self.file1, self.sheet1, handle_merged=True)
+            self.progress.emit(30, "正在读取文件 2...")
+            df2 = ExcelDiffer.read_excel_raw(self.file2, self.sheet2, handle_merged=True)
+            mode_text = "主键" if self.key_cols else "序列"
+            self.progress.emit(50, f"正在进行{mode_text}比对...")
+            columns, results = ExcelDiffer.compare_dataframes(df1, df2, key_columns=self.key_cols)
+            total_rows = len(results)
+            self.progress.emit(80, f"比对完成，正在准备渲染 {total_rows} 行数据...")
+            self.finished.emit(columns, results)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class KeyColumnsDialog(QtWidgets.QDialog):
+    def __init__(self, columns, selected, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择关键列")
+        self.resize(520, 420)
+        layout = QtWidgets.QVBoxLayout(self)
+        label = QtWidgets.QLabel("请勾选作为主键的列：")
+        layout.addWidget(label)
+        self.list_widget = QtWidgets.QListWidget()
+        for col in columns:
+            item = QtWidgets.QListWidgetItem(col)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Checked if col in selected else QtCore.Qt.Unchecked)
+            self.list_widget.addItem(item)
+        layout.addWidget(self.list_widget)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_columns(self):
+        selected = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == QtCore.Qt.Checked:
+                selected.append(item.text())
+        return selected
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self, version):
+        super().__init__()
+        self.version = version
+        self.setWindowTitle(f"Excel 差异比对工具 - {version}")
+        self.setAcceptDrops(True)
+        self._syncing_scroll = False
+        self._syncing_selection = False
+        self.last_columns = None
+        self.all_results = None
+        self.display_results = None
+        self.key_columns = []
         self.base_col_widths = []
-        self.col_widths = []
-        self.freeze_panes = tk.BooleanVar(value=True) # 默认开启冻结
-        self.freeze_rows = tk.IntVar(value=1)  # 冻结前 N 行 (含表头)
-        self.freeze_cols = tk.IntVar(value=1)  # 冻结前 M 列
-        self.selected_cell = None # 新增：选中的单元格 (row_idx, col_idx)
-        
-        # 缓存的控件
-        self.header_widgets = []
-        self.cell_widgets = {} # (row_idx, col_idx) -> label
-        self.visible_rows = 0
-        
-        # 性能优化：对象池
-        self._widget_pool = []
-        
-        # 绑定事件
-        self.canvas.bind("<Configure>", self._on_configure)
-        self._bind_mouse_wheel(self.canvas)
-
-    def _on_configure(self, event):
-        """窗口大小改变时触发"""
-        self._update_view()
-
-    def _bind_mouse_wheel(self, widget):
-        widget.bind("<MouseWheel>", self._on_mouse_wheel)
-        widget.bind("<Button-4>", self._on_mouse_wheel)
-        widget.bind("<Button-5>", self._on_mouse_wheel)
-
-    def _on_mouse_wheel(self, event):
-        if event.num == 4 or event.delta > 0:
-            delta = -1
-        elif event.num == 5 or event.delta < 0:
-            delta = 1
-        else:
-            delta = 0
-
-        if event.state & 0x0001: # Shift key
-            self.canvas.xview_scroll(delta, "units")
-        else:
-            self.canvas.yview_scroll(delta, "units")
-        
-        self._update_view() 
-        
-        if hasattr(self, 'on_scroll_callback'):
-            self.on_scroll_callback()
-        return "break"
-
-    def _on_vscroll(self, *args):
-        """处理垂直滚动条拖动"""
-        self.canvas.yview(*args)
-        self._update_view()
-        if hasattr(self, 'on_scroll_callback'):
-            self.on_scroll_callback()
-
-    def _on_hscroll(self, *args):
-        """处理水平滚动条拖动"""
-        self.canvas.xview(*args)
-        self._update_view()
-        if hasattr(self, 'on_scroll_callback'):
-            self.on_scroll_callback()
-
-    def clear(self):
-        # 将所有控件归还对象池
-        for widget in self.cell_widgets.values():
-            widget.place_forget()
-            self._widget_pool.append(widget)
-        self.cell_widgets = {}
-        
-        for widget in self.header_widgets:
-            if widget:
-                widget.place_forget()
-                self._widget_pool.append(widget)
-        self.header_widgets = []
-        
-        # 清理剩余可能的子控件
-        for widget in self.scrollable_frame.winfo_children():
-            if widget not in self._widget_pool:
-                widget.destroy()
-
-        self.data = []
-        self.tags_list = []
-        self.row_heights = []
-        self.col_widths = []
-
-    def set_data(self, columns, data, tags_list, row_height=30):
-        self.clear()
-        self.columns = columns
-        self.data = data
-        self.tags_list = tags_list
-        self.base_row_height = row_height
-        self.row_height = row_height
-        self.selected_cell = None
-        
-        if not data:
-            return
-        
-        # 1. 初始化列表长度
-        self.header_widgets = [None] * len(columns)
-        
-        # 2. 初始化每行高度 (表头 + 数据行)
-        self.row_heights = [row_height] * (len(data) + 1)
-
-        # 3. 预计算每列的大致基础宽度
-        def get_display_width(s):
-            """计算字符串在显示时的近似宽度（中文字符占 1.8 倍宽度）"""
-            width = 0
-            for char in str(s):
-                if ord(char) > 127:
-                    width += 1.8
-                else:
-                    width += 1
-            return width
-
-        self.base_col_widths = [80] * len(columns)
-        for i, col in enumerate(columns):
-            max_w = get_display_width(col)
-            sample_size = min(len(data), 300)
-            for row in data[:sample_size]:
-                val = str(row[i])
-                if val.startswith(">>> "): val = val[4:-4]
-                max_w = max(max_w, get_display_width(val))
-            self.base_col_widths[i] = min(max_w * 8 + 30, 600)
-        
-        # 初始列宽 = 基础宽度
-        self.col_widths = [int(w) for w in self.base_col_widths]
-
-        self._update_scroll_region()
-        self._update_view()
-
-    def _get_row_y(self, row_idx):
-        """计算第 row_idx 行的起始 y 坐标"""
-        return sum(self.row_heights[:row_idx])
-
-    def _get_row_at_y(self, y_coord):
-        """根据 y 坐标查找所在的行索引"""
-        current_y = 0
-        for i, h in enumerate(self.row_heights):
-            if current_y <= y_coord < current_y + h:
-                return i
-            current_y += h
-        return len(self.row_heights) - 1
-
-    def _get_col_x(self, col_idx):
-        """计算第 col_idx 列的起始 x 坐标"""
-        return sum(self.col_widths[:col_idx])
-
-    def _get_col_at_x(self, x_coord):
-        """根据 x 坐标查找所在的列索引"""
-        current_x = 0
-        for i, w in enumerate(self.col_widths):
-            if current_x <= x_coord < current_x + w:
-                return i
-            current_x += w
-        return len(self.col_widths) - 1
-
-    def _update_scroll_region(self):
-        """更新滚动区域大小"""
-        if not self.data:
-            return
-        
-        total_width = sum(self.col_widths)
-        total_height = sum(self.row_heights)
-        self.scrollable_frame.config(width=total_width, height=total_height)
-        self.canvas.config(scrollregion=(0, 0, total_width, total_height))
-
-    def _on_cell_click(self, event, row_idx, col_idx):
-        """单元格点击事件"""
-        self.selected_cell = (row_idx, col_idx)
-        self._update_view()
-        if hasattr(self, 'on_select_callback'):
-            self.on_select_callback(row_idx, col_idx)
-
-    def _update_view(self):
-        """核心：虚拟化渲染 + 对象池优化"""
-        if not self.data:
-            return
-
-        # 1. 计算布局参数
-        total_width = sum(self.col_widths)
-        total_height = sum(self.row_heights)
-        
-        h_start, h_end = self.canvas.xview()
-        v_start, v_end = self.canvas.yview()
-        
-        x_offset = h_start * total_width
-        y_offset = v_start * total_height
-        
-        view_w = self.canvas.winfo_width()
-        view_h = self.canvas.winfo_height()
-
-        # 计算可见行/列范围
-        start_row = self._get_row_at_y(y_offset)
-        end_row = self._get_row_at_y(y_offset + view_h) + 1
-        start_col = self._get_col_at_x(x_offset)
-        end_col = self._get_col_at_x(x_offset + view_w) + 1
-        
-        start_row = max(0, start_row)
-        end_row = min(len(self.data) + 1, end_row)
-        start_col = max(0, start_col)
-        end_col = min(len(self.columns), end_col)
-
-        f_rows = self.freeze_rows.get()
-        f_cols = self.freeze_cols.get()
-
-        current_visible_keys = set() # (row, col)
-
-        # 2. 渲染表头 (row 0)
-        header_cols = set(range(start_col, end_col))
-        for c in range(f_cols): header_cols.add(c)
-        
-        for j in header_cols:
-            key = (0, j)
-            current_visible_keys.add(key)
-            
-            if self.header_widgets[j] is None:
-                if self._widget_pool:
-                    lbl = self._widget_pool.pop()
-                else:
-                    lbl = tk.Label(self.scrollable_frame, padx=5, highlightthickness=0)
-                    self._bind_mouse_wheel(lbl)
-                
-                self.header_widgets[j] = lbl
-
-            # 统一配置属性（防止回收时样式残留）
-            lbl = self.header_widgets[j]
-            bg = '#CCE8FF' if self.selected_cell == (0, j) else '#F0F0F0'
-            lbl.config(
-                text=self.columns[j], 
-                font=('Microsoft YaHei', 10, 'bold'), 
-                relief="raised",
-                borderwidth=1,
-                bg=bg
-            )
-            lbl.bind("<Button-1>", lambda e, c=j: self._on_cell_click(e, 0, c))
-
-            # 布局
-            tx = self._get_col_x(j)
-            ty = 0
-            if f_rows > 0: ty = y_offset
-            if j < f_cols: tx = x_offset + self._get_col_x(j)
-            
-            self.header_widgets[j].place(x=tx, y=ty, width=self.col_widths[j], height=self.row_heights[0])
-            if f_rows > 0 or j < f_cols: self.header_widgets[j].lift()
-
-        # 3. 渲染数据行
-        visible_data_rows = set(range(max(1, start_row), end_row))
-        for r in range(1, f_rows): 
-            if r < len(self.row_heights): visible_data_rows.add(r)
-            
-        for r_idx in visible_data_rows:
-            i = r_idx - 1
-            row_vals = self.data[i]
-            tags = self.tags_list[i]
-            status = row_vals[0] if row_vals else ""
-            
-            data_cols = set(range(start_col, end_col))
-            for c in range(f_cols): data_cols.add(c)
-            
-            for j in data_cols:
-                key = (r_idx, j)
-                current_visible_keys.add(key)
-                
-                if key not in self.cell_widgets:
-                    if self._widget_pool:
-                        lbl = self._widget_pool.pop()
-                    else:
-                        lbl = tk.Label(self.scrollable_frame, padx=5, highlightthickness=0, anchor="w")
-                        self._bind_mouse_wheel(lbl)
-                    self.cell_widgets[key] = lbl
-                
-                lbl = self.cell_widgets[key]
-                val = str(row_vals[j])
-                cell_bg, fg = "white", "black"
-                
-                if j == 0:
-                    if status == "新增": cell_bg = '#CCFFCC'
-                    elif status == "删除": cell_bg = '#FFFFCC'
-                    elif status == "修改": cell_bg = '#E6F3FF'
-                    else: cell_bg = '#F8F8F8'
-                else:
-                    if 'added' in tags: cell_bg = '#F0FFF0'
-                    elif 'deleted' in tags: cell_bg = '#FFFFF0'
-                
-                if val.startswith(">>> ") and val.endswith(" <<<"):
-                    val = val[4:-4]; cell_bg = '#FFCCCC'; fg = '#CC0000'
-                
-                # 统一配置属性
-                final_bg = '#CCE8FF' if self.selected_cell == (r_idx, j) else cell_bg
-                lbl.config(
-                    text=val, 
-                    font=('Microsoft YaHei', 10), 
-                    bg=final_bg, 
-                    fg=fg,
-                    relief="groove",
-                    borderwidth=1
-                )
-                lbl.bind("<Button-1>", lambda e, r=r_idx, c=j: self._on_cell_click(e, r, c))
-                lbl.original_bg = cell_bg
-
-                # 布局
-                tx = self._get_col_x(j)
-                ty = self._get_row_y(r_idx)
-                if r_idx < f_rows: ty = y_offset + self._get_row_y(r_idx)
-                if j < f_cols: tx = x_offset + self._get_col_x(j)
-                
-                self.cell_widgets[key].place(x=tx, y=ty, width=self.col_widths[j], height=self.row_heights[r_idx])
-                if r_idx < f_rows or j < f_cols: self.cell_widgets[key].lift()
-
-        # 4. 回收不再可见的控件
-        # 处理表头回收
-        for j in range(len(self.columns)):
-            if (0, j) not in current_visible_keys and self.header_widgets[j] is not None:
-                self.header_widgets[j].place_forget()
-                self._widget_pool.append(self.header_widgets[j])
-                self.header_widgets[j] = None
-        
-        # 处理数据行回收
-        to_remove = []
-        for key, widget in self.cell_widgets.items():
-            if key not in current_visible_keys:
-                widget.place_forget()
-                self._widget_pool.append(widget)
-                to_remove.append(key)
-        for key in to_remove: del self.cell_widgets[key]
-
-class LoadingDialog:
-    """比对过程中的加载弹窗 - 升级带百分比和详细进度"""
-    def __init__(self, parent, title="请稍候", message="正在处理中..."):
-        self.top = ttk.Toplevel(parent)
-        self.top.title(title)
-        self.top.geometry("400x180")
-        self.top.resizable(False, False)
-        self.top.transient(parent)
-        self.top.grab_set()
-        
-        # 居中显示
-        parent_x = parent.winfo_x()
-        parent_y = parent.winfo_y()
-        parent_w = parent.winfo_width()
-        parent_h = parent.winfo_height()
-        x = parent_x + (parent_w - 400) // 2
-        y = parent_y + (parent_h - 180) // 2
-        self.top.geometry(f"+{x}+{y}")
-
-        frame = ttk.Frame(self.top, padding=20)
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        self.label = ttk.Label(frame, text=message, font=('Microsoft YaHei', 10))
-        self.label.pack(pady=(0, 5), anchor=W)
-
-        self.progress_var = tk.DoubleVar(value=0)
-        self.progress = ttk.Progressbar(frame, variable=self.progress_var, maximum=100, bootstyle=INFO)
-        self.progress.pack(fill=X, pady=10)
-
-        self.detail_label = ttk.Label(frame, text="准备开始...", font=('Microsoft YaHei', 9), bootstyle=SECONDARY)
-        self.detail_label.pack(anchor=W)
-
-        # 禁用关闭按钮
-        self.top.protocol("WM_DELETE_WINDOW", lambda: None)
-
-    def update_progress(self, percent, detail_text):
-        """更新进度条和详情文本"""
-        self.progress_var.set(percent)
-        self.detail_label.config(text=detail_text)
-        self.top.update_idletasks()
-
-    def close(self):
-        self.top.grab_release()
-        self.top.destroy()
-
-class ExcelComparatorApp:
-    """Excel 比对工具主窗口类"""
-    
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Excel 差异比对工具")
-        self.root.geometry("1000x800")
-
-        # 设置窗口图标
+        self.left_model = None
+        self.right_model = None
+        self.progress_dialog = None
+        self.setup_ui()
+        self.setup_menu()
         self.set_window_icon()
 
-        # 拖拽支持
-        windnd.hook_dropfiles(self.root, func=self.on_file_drop)
-
-        # 变量存储
-        self.file1_path = tk.StringVar()
-        self.file2_path = tk.StringVar()
-        self.sync_v_scroll = tk.BooleanVar(value=True) # 默认开启垂直滚动同步
-        self.sync_h_scroll = tk.BooleanVar(value=True) # 默认开启左右同步滚动
-        self.sheet_list1 = []
-        self.sheet_list2 = []
-        self.df1 = None
-        self.df2 = None
-
-        # 界面控制变量
-        self.freeze_rows = tk.IntVar(value=1)
-        self.freeze_cols = tk.IntVar(value=1)
-        self.row_h_var = tk.DoubleVar(value=30)
-        self.col_w_var = tk.DoubleVar(value=1.0)
-        self.sel_row_h = tk.IntVar(value=30)
-        self.sel_col_w = tk.IntVar(value=100)
-        self.key_columns = [] # 选中的关键列
-
-        # 样式设置
-        self.setup_styles()
-
-        self._scrolling = False  # 用于防止同步滚动时的递归循环
-        self.setup_ui()
-        self.create_menu()
-
-    def on_file_drop(self, files):
-        """处理文件拖拽"""
-        for file_path in files:
-            path_str = file_path.decode('gbk') if isinstance(file_path, bytes) else file_path
-            if path_str.lower().endswith(('.xlsx', '.xls')):
-                # 根据拖拽位置或当前状态决定填入哪个框
-                # 这里简单策略：如果第一个为空填第一个，否则填第二个
-                if not self.file1_path.get():
-                    self.file1_path.set(path_str)
-                    self.load_sheets(path_str, self.sheet_combo1)
-                else:
-                    self.file2_path.set(path_str)
-                    self.load_sheets(path_str, self.sheet_combo2)
-
-    def setup_styles(self):
-        """配置自定义样式"""
-        self.style = ttk.Style()
-        self.style.configure("Treeview.Heading", font=('Microsoft YaHei', 10, 'bold'))
-        # 自定义一些特定样式
-        self.style.configure('Custom.TFrame', background='#f8f9fa')
-        self.style.configure('Header.TLabel', font=('Microsoft YaHei', 11, 'bold'))
-        self.style.configure('Action.TButton', font=('Microsoft YaHei', 10, 'bold'))
-
-    def create_menu(self):
-        """创建菜单栏"""
-        menubar = tk.Menu(self.root)
-        
-        # 帮助菜单
-        help_menu = tk.Menu(menubar, tearoff=0)
-        help_menu.add_command(label="使用说明", command=self.show_usage)
-        help_menu.add_command(label="版本说明", command=self.show_version)
-        
-        menubar.add_cascade(label="帮助", menu=help_menu)
-        
-        self.root.config(menu=menubar)
-
-    def show_usage(self):
-        """显示使用说明"""
-        usage_text = """
-Excel 差异比对工具 使用说明：
-
-1. 选择文件：点击“浏览...”按钮选择需要比对的两个 Excel 文件（旧版本和新版本）。
-2. 选择 Sheet：在下拉框中选择要比对的工作表。
-3. 设置选项：
-   - 垂直/左右滚动同步：开启后两侧表格将同步滚动。
-4. 开始比对：点击“开始比对”按钮，程序将分析差异并在下方展示。
-5. 结果说明：
-   - 单元格浅红填充：表示内容发生了变化。
-   - 行浅绿填充：表示该行为新增行。
-   - 行浅黄填充（仅左侧）：表示该行为删除行。
-6. 导出结果：比对完成后，点击“导出比对结果”可将差异保存为 Excel 文件。
-
-注意：程序已默认开启合并单元格自动填充功能，确保比对结果的准确性。
-
-快捷键：
-- 鼠标滚轮：垂直滚动。
-- Shift + 鼠标滚轮：水平滚动。
-"""
-        messagebox.showinfo("使用说明", usage_text)
-
-    def show_version(self):
-        """显示版本说明"""
-        version = "V1.9.2"
-        try:
-            if os.path.exists("updates_notes.txt"):
-                with open("updates_notes.txt", "r", encoding="utf-8") as f:
-                    first_line = f.readline().strip()
-                    if first_line.startswith('V'):
-                        # 格式：V1.2.0 2025-12-26 -> 提取 V1.2.0
-                        version = first_line.split(' ')[0]
-        except Exception:
-            pass
-            
-        version_text = f"""
-Excel 差异比对工具
-
-当前版本：{version}
-更新日期：2025-12-29
-
-更新亮点：
-- 升级：全面现代化 UI 改造，支持主题切换与深色模式。
-- 优化：操作 UI 深度整合，将所有设置集中于顶部，提升操作效率。
-- 新增：恢复并优化“选中精调”功能，支持对选中行列尺寸进行微调。
-- 新增：支持文件拖拽 (Drag & Drop) 快速录入数据源。
-- 核心：支持关键列（主键）比对，精准定位乱序数据差异。
-"""
-        messagebox.showinfo("版本说明", version_text)
+    def setup_menu(self):
+        menubar = self.menuBar()
+        help_menu = menubar.addMenu("帮助")
+        usage_action = QtWidgets.QAction("使用说明", self)
+        version_action = QtWidgets.QAction("版本说明", self)
+        usage_action.triggered.connect(self.show_usage)
+        version_action.triggered.connect(self.show_version)
+        help_menu.addAction(usage_action)
+        help_menu.addAction(version_action)
 
     def setup_ui(self):
-        # 使用 ttkbootstrap 的布局容器
-        main_container = ttk.Frame(self.root, padding=10)
-        main_container.pack(fill=tk.BOTH, expand=True)
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        main_layout = QtWidgets.QVBoxLayout(central)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setSpacing(5)
 
-        # 1. 顶部操作面板：整合所有配置与设置
-        top_panel = ttk.Frame(main_container)
-        top_panel.pack(fill=tk.X, pady=(0, 10))
+        # 1. 顶部配置区域 (精简布局)
+        config_panel = QtWidgets.QWidget()
+        config_layout = QtWidgets.QVBoxLayout(config_panel)
+        config_layout.setContentsMargins(0, 0, 0, 0)
+        config_layout.setSpacing(2)
 
-        # --- 第一行：数据源配置 ---
-        ds_frame = ttk.Labelframe(top_panel, text="数据源配置", padding=10, bootstyle=PRIMARY)
-        ds_frame.pack(fill=tk.X, pady=(0, 5))
+        # 数据源行
+        data_group = QtWidgets.QGroupBox("数据源与比对配置")
+        data_layout = QtWidgets.QGridLayout(data_group)
+        data_layout.setContentsMargins(10, 5, 10, 5)
+        data_layout.setSpacing(8)
         
-        # 配置列权重
-        for i in range(5): ds_frame.columnconfigure(i, weight=1)
-
-        # 文件 1
-        ttk.Label(ds_frame, text="文件 1 (旧):", font=('Microsoft YaHei', 9, 'bold')).grid(row=0, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(ds_frame, textvariable=self.file1_path, width=40).grid(row=0, column=1, columnspan=2, sticky=tk.EW, padx=5)
-        ttk.Button(ds_frame, text="浏览...", command=lambda: self.browse_file(1), bootstyle=SECONDARY).grid(row=0, column=3, padx=5)
-        self.sheet_combo1 = ttk.Combobox(ds_frame, state="readonly", width=15)
-        self.sheet_combo1.grid(row=0, column=4, sticky=tk.EW, padx=5)
-
-        # 文件 2
-        ttk.Label(ds_frame, text="文件 2 (新):", font=('Microsoft YaHei', 9, 'bold')).grid(row=1, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(ds_frame, textvariable=self.file2_path, width=40).grid(row=1, column=1, columnspan=2, sticky=tk.EW, padx=5)
-        ttk.Button(ds_frame, text="浏览...", command=lambda: self.browse_file(2), bootstyle=SECONDARY).grid(row=1, column=3, padx=5)
-        self.sheet_combo2 = ttk.Combobox(ds_frame, state="readonly", width=15)
-        self.sheet_combo2.grid(row=1, column=4, sticky=tk.EW, padx=5)
-
-        # --- 第二行：功能设置与比对选项 (并排) ---
-        middle_settings = ttk.Frame(top_panel)
-        middle_settings.pack(fill=tk.X, pady=5)
-
-        # A. 比对模式与关键列
-        opt_group = ttk.Labelframe(middle_settings, text="比对模式", padding=10, bootstyle=INFO)
-        opt_group.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        self.file1_edit = QtWidgets.QLineEdit()
+        self.file2_edit = QtWidgets.QLineEdit()
+        self.sheet_combo1 = QtWidgets.QComboBox()
+        self.sheet_combo2 = QtWidgets.QComboBox()
+        self.file1_edit.setPlaceholderText("选择或拖入旧 Excel 文件...")
+        self.file2_edit.setPlaceholderText("选择或拖入新 Excel 文件...")
         
-        self.key_mode_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt_group, text="启用主键模式", variable=self.key_mode_var, command=self.toggle_key_mode, bootstyle="round-toggle").pack(side=tk.LEFT, padx=5)
-        self.btn_select_keys = ttk.Button(opt_group, text="选择关键列...", command=self.select_key_columns, state=tk.DISABLED, bootstyle="outline-info")
-        self.btn_select_keys.pack(side=tk.LEFT, padx=5)
-        self.key_cols_label = ttk.Label(opt_group, text="（未选择）", font=('Microsoft YaHei', 8), bootstyle=SECONDARY)
-        self.key_cols_label.pack(side=tk.LEFT, padx=5)
+        browse_btn1 = QtWidgets.QPushButton("浏览...")
+        browse_btn2 = QtWidgets.QPushButton("浏览...")
+        browse_btn1.setFixedWidth(60)
+        browse_btn2.setFixedWidth(60)
+        browse_btn1.clicked.connect(lambda: self.browse_file(1))
+        browse_btn2.clicked.connect(lambda: self.browse_file(2))
 
-        # B. 滚动同步
-        sync_group = ttk.Labelframe(middle_settings, text="视图同步", padding=10, bootstyle=INFO)
-        sync_group.pack(side=tk.LEFT, fill=tk.Y, padx=5)
-        ttk.Checkbutton(sync_group, text="纵滚", variable=self.sync_v_scroll, bootstyle="round-toggle").pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(sync_group, text="横滚", variable=self.sync_h_scroll, bootstyle="round-toggle").pack(side=tk.LEFT, padx=5)
-
-        # C. 视图精调 (行高列宽冻结)
-        view_group = ttk.Labelframe(middle_settings, text="视图缩放/冻结", padding=10, bootstyle=INFO)
-        view_group.pack(side=tk.LEFT, fill=tk.Y, padx=5)
+        data_layout.addWidget(QtWidgets.QLabel("旧文件:"), 0, 0)
+        data_layout.addWidget(self.file1_edit, 0, 1)
+        data_layout.addWidget(browse_btn1, 0, 2)
+        data_layout.addWidget(self.sheet_combo1, 0, 3)
+        data_layout.addWidget(QtWidgets.QLabel("新文件:"), 0, 4)
+        data_layout.addWidget(self.file2_edit, 0, 5)
+        data_layout.addWidget(browse_btn2, 0, 6)
+        data_layout.addWidget(self.sheet_combo2, 0, 7)
+        data_layout.setColumnStretch(1, 2)
+        data_layout.setColumnStretch(5, 2)
+        data_layout.setColumnStretch(3, 1)
+        data_layout.setColumnStretch(7, 1)
         
-        # 冻结
-        f_box = ttk.Frame(view_group)
-        f_box.pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Label(f_box, text="冻结R/C:").pack(side=tk.LEFT)
-        tk.Spinbox(f_box, from_=0, to=50, textvariable=self.freeze_rows, width=2).pack(side=tk.LEFT, padx=2)
-        tk.Spinbox(f_box, from_=0, to=20, textvariable=self.freeze_cols, width=2).pack(side=tk.LEFT, padx=2)
-        self.freeze_rows.trace_add("write", self.sync_freeze_rows)
-        self.freeze_cols.trace_add("write", self.sync_freeze_cols)
-
-        # 缩放滑块
-        ttk.Label(view_group, text="行高:").pack(side=tk.LEFT)
-        ttk.Scale(view_group, from_=20, to=100, variable=self.row_h_var, orient=tk.HORIZONTAL, length=60, command=self.on_row_height_change).pack(side=tk.LEFT, padx=2)
-        self.row_height_label = ttk.Label(view_group, text="30px", font=('Microsoft YaHei', 8))
-        self.row_height_label.pack(side=tk.LEFT, padx=(0, 5))
-
-        ttk.Label(view_group, text="列宽:").pack(side=tk.LEFT)
-        ttk.Scale(view_group, from_=0.5, to=3.0, variable=self.col_w_var, orient=tk.HORIZONTAL, length=60, command=self.on_col_width_change).pack(side=tk.LEFT, padx=2)
-        self.col_width_label = ttk.Label(view_group, text="100%", font=('Microsoft YaHei', 8))
-        self.col_width_label.pack(side=tk.LEFT)
-
-        # D. 选中项精调
-        sel_group = ttk.Labelframe(middle_settings, text="选中精调", padding=10, bootstyle=INFO)
-        sel_group.pack(side=tk.LEFT, fill=tk.Y, padx=5)
+        config_layout.addWidget(data_group)
         
-        ttk.Label(sel_group, text="行高:").pack(side=tk.LEFT)
-        tk.Spinbox(sel_group, from_=10, to=500, textvariable=self.sel_row_h, width=3, command=self.adjust_selected_row_height).pack(side=tk.LEFT, padx=2)
-        self.sel_row_h.trace_add("write", lambda *args: self.adjust_selected_row_height())
+        # 选项行
+        options_layout = QtWidgets.QHBoxLayout()
+        options_layout.setSpacing(15)
 
-        ttk.Label(sel_group, text="列宽:").pack(side=tk.LEFT, padx=(5, 0))
-        tk.Spinbox(sel_group, from_=10, to=1000, textvariable=self.sel_col_w, width=4, command=self.adjust_selected_col_width).pack(side=tk.LEFT, padx=2)
-        self.sel_col_w.trace_add("write", lambda *args: self.adjust_selected_col_width())
+        # 比对模式与主键
+        key_layout = QtWidgets.QHBoxLayout()
+        self.key_mode_cb = QtWidgets.QCheckBox("主键模式")
+        self.key_btn = QtWidgets.QPushButton("选择关键列...")
+        self.key_label = QtWidgets.QLabel("未选")
+        self.key_label.setStyleSheet("color: gray;")
+        self.key_btn.setEnabled(False)
+        self.key_mode_cb.toggled.connect(self.toggle_key_mode)
+        self.key_btn.clicked.connect(self.select_key_columns)
+        key_layout.addWidget(self.key_mode_cb)
+        key_layout.addWidget(self.key_btn)
+        key_layout.addWidget(self.key_label)
+        options_layout.addLayout(key_layout)
 
-        # --- 第三行：操作按钮、主题切换与图例 (整合) ---
-        action_bar = ttk.Frame(top_panel)
-        action_bar.pack(fill=tk.X, pady=(5, 0))
+        # 搜索过滤
+        filter_layout = QtWidgets.QHBoxLayout()
+        self.search_edit = QtWidgets.QLineEdit()
+        self.search_edit.setPlaceholderText("搜索内容...")
+        self.search_edit.setFixedWidth(150)
+        self.filter_combo = QtWidgets.QComboBox()
+        self.filter_combo.addItems(["全部状态", "只看修改", "只看新增", "只看删除", "一致项"])
+        self.search_edit.textChanged.connect(self.apply_filter)
+        self.filter_combo.currentIndexChanged.connect(self.apply_filter)
+        filter_layout.addWidget(QtWidgets.QLabel("搜索:"))
+        filter_layout.addWidget(self.search_edit)
+        filter_layout.addWidget(self.filter_combo)
+        options_layout.addLayout(filter_layout)
 
-        # 核心按钮
-        self.btn_compare = ttk.Button(action_bar, text="🚀 开始比对差异", command=self.compare_files, bootstyle=SUCCESS, width=18)
-        self.btn_compare.pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(action_bar, text="📊 导出结果", command=self.export_results, bootstyle=INFO, width=15).pack(side=tk.LEFT, padx=5)
-
-        # 主题
-        ttk.Label(action_bar, text="🎨 主题:", font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=(15, 5))
-        self.theme_combo = ttk.Combobox(action_bar, values=['cosmo', 'flatly', 'litera', 'minty', 'lumen', 'sandstone', 'yeti', 'pulse', 'united', 'morph', 'journal', 'darkly', 'superhero', 'solar', 'cyborg', 'vapor'], state="readonly", width=10)
-        self.theme_combo.set('cosmo')
-        self.theme_combo.pack(side=tk.LEFT)
-        self.theme_combo.bind('<<ComboboxSelected>>', self.change_theme)
-
-        # 图例说明 (放在最右侧)
-        legend_box = ttk.Frame(action_bar)
-        legend_box.pack(side=tk.RIGHT)
-        ttk.Label(legend_box, text="修改", background='#E6F3FF', foreground='black', width=4, anchor=tk.CENTER).pack(side=tk.LEFT, padx=2)
-        ttk.Label(legend_box, text="新增", background='#CCFFCC', foreground='black', width=4, anchor=tk.CENTER).pack(side=tk.LEFT, padx=2)
-        ttk.Label(legend_box, text="删除", background='#FFFFCC', foreground='black', width=4, anchor=tk.CENTER).pack(side=tk.LEFT, padx=2)
-        ttk.Label(legend_box, text="单元格差异", background='#FFCCCC', foreground='#CC0000', padding=(5, 0)).pack(side=tk.LEFT, padx=5)
-
-        # 2. 结果展示区域 (中间填满)
-        result_container = ttk.Frame(main_container)
-        result_container.pack(fill=tk.BOTH, expand=True)
+        # 视图控制
+        view_layout = QtWidgets.QHBoxLayout()
+        self.sync_v_cb = QtWidgets.QCheckBox("纵滚同步")
+        self.sync_h_cb = QtWidgets.QCheckBox("横滚同步")
+        self.freeze_cb = QtWidgets.QCheckBox("冻结首列")
+        self.sync_v_cb.setChecked(True)
+        self.sync_h_cb.setChecked(True)
+        self.freeze_cb.setChecked(False)
+        self.detail_toggle = QtWidgets.QCheckBox("差异明细")
         
-        self.paned = ttk.Panedwindow(result_container, orient=tk.HORIZONTAL)
-        self.paned.pack(fill=tk.BOTH, expand=True)
+        self.detail_toggle.toggled.connect(self.toggle_detail_panel)
+        self.freeze_cb.toggled.connect(self.toggle_freeze)
+        
+        view_layout.addWidget(self.sync_v_cb)
+        view_layout.addWidget(self.sync_h_cb)
+        view_layout.addWidget(self.freeze_cb)
+        view_layout.addWidget(self.detail_toggle)
+        options_layout.addLayout(view_layout)
+        
+        options_layout.addStretch()
+        
+        # 操作按钮
+        self.compare_btn = QtWidgets.QPushButton("开始比对")
+        self.export_btn = QtWidgets.QPushButton("导出结果")
+        self.compare_btn.setMinimumWidth(100)
+        self.compare_btn.setStyleSheet("background-color: #0078d7; color: white; font-weight: bold; padding: 5px;")
+        self.compare_btn.clicked.connect(self.compare_files)
+        self.export_btn.clicked.connect(self.export_results)
+        options_layout.addWidget(self.compare_btn)
+        options_layout.addWidget(self.export_btn)
+        
+        config_layout.addLayout(options_layout)
+        main_layout.addWidget(config_panel)
 
-        self.left_frame = ttk.Labelframe(self.paned, text="文件 1 (旧)", bootstyle=SECONDARY)
-        self.paned.add(self.left_frame, weight=1)
-        self.table_left = ScrollableTable(self.left_frame)
-        self.table_left.pack(fill=tk.BOTH, expand=True)
-        self.table_left.on_select_callback = lambda r, c: self.on_cell_selected(r, c, source="left")
+        # 2. 中间主体区域 (Tab 切换)
+        self.tab_widget = QtWidgets.QTabWidget()
         
-        self.right_frame = ttk.Labelframe(self.paned, text="文件 2 (新)", bootstyle=SECONDARY)
-        self.paned.add(self.right_frame, weight=1)
-        self.table_right = ScrollableTable(self.right_frame)
-        self.table_right.pack(fill=tk.BOTH, expand=True)
-        self.table_right.on_select_callback = lambda r, c: self.on_cell_selected(r, c, source="right")
-
-        # 绑定同步滚动逻辑
-        self.table_left.canvas.bind("<Configure>", lambda e: self.sync_scroll_setup())
-        self.table_right.canvas.bind("<Configure>", lambda e: self.sync_scroll_setup())
+        # Tab 1: 双窗同步比对
+        self.compare_tab = QtWidgets.QWidget()
+        compare_tab_layout = QtWidgets.QVBoxLayout(self.compare_tab)
+        compare_tab_layout.setContentsMargins(0, 0, 0, 0)
         
-        # 缓存比对结果用于导出
-        self.last_columns = None
-        self.last_results = None
-
-    def sync_scroll_setup(self):
-        """设置同步滚动绑定"""
-        self.table_left.canvas.configure(yscrollcommand=lambda *args: self.sync_scroll_y(self.table_left, *args))
-        self.table_right.canvas.configure(yscrollcommand=lambda *args: self.sync_scroll_y(self.table_right, *args))
-        self.table_left.canvas.configure(xscrollcommand=lambda *args: self.sync_scroll_x(self.table_left, *args))
-        self.table_right.canvas.configure(xscrollcommand=lambda *args: self.sync_scroll_x(self.table_right, *args))
-
-    def on_cell_selected(self, row_idx, col_idx, source="left"):
-        """处理单元格选中事件"""
-        target_table = self.table_right if source == "left" else self.table_left
-        source_table = self.table_left if source == "left" else self.table_right
-        
-        # 同步选中状态
-        target_table.selected_cell = (row_idx, col_idx)
-        target_table._update_view()
-        
-        # 更新调整控件的值
-        self.sel_row_h.set(source_table.row_heights[row_idx])
-        self.sel_col_w.set(source_table.col_widths[col_idx])
-
-    def adjust_selected_row_height(self):
-        """调整选中行的高度"""
-        if not self.table_left.data: return
-        
-        row_idx = self.table_left.selected_cell[0] if self.table_left.selected_cell else None
-        if row_idx is None:
-            row_idx = self.table_right.selected_cell[0] if self.table_right.selected_cell else None
-        
-        if row_idx is not None:
-            try:
-                new_h = int(self.sel_row_h.get())
-                if 10 <= new_h <= 500:
-                    self.table_left.row_heights[row_idx] = new_h
-                    self.table_right.row_heights[row_idx] = new_h
-                    self.update_tables_view()
-            except (ValueError, tk.TclError):
-                pass
-
-    def adjust_selected_col_width(self):
-        """调整选中列的宽度"""
-        if not self.table_left.data: return
-        
-        col_idx = self.table_left.selected_cell[1] if self.table_left.selected_cell else None
-        if col_idx is None:
-            col_idx = self.table_right.selected_cell[1] if self.table_right.selected_cell else None
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.left_table = QtWidgets.QTableView()
+        self.right_table = QtWidgets.QTableView()
+        for t in [self.left_table, self.right_table]:
+            t.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
+            t.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+            t.setAlternatingRowColors(True)
+            t.horizontalHeader().setStretchLastSection(True)
             
-        if col_idx is not None:
-            try:
-                new_w = int(self.sel_col_w.get())
-                if 10 <= new_w <= 1000:
-                    self.table_left.col_widths[col_idx] = new_w
-                    self.table_right.col_widths[col_idx] = new_w
-                    self.update_tables_view()
-            except (ValueError, tk.TclError):
-                pass
-
-    def sync_scroll_y(self, source_table, *args):
-        """同步垂直滚动"""
-        if self._scrolling:
-            return
+        self.splitter.addWidget(self.left_table)
+        self.splitter.addWidget(self.right_table)
         
-        self._scrolling = True
-        try:
-            # 更新源表格的滚动条
-            source_table.vsb.set(*args)
-            source_table._update_view()
-            
-            # 如果开启了同步，更新另一个表格
-            if self.sync_v_scroll.get():
-                target_table = self.table_right if source_table == self.table_left else self.table_left
-                target_table.vsb.set(*args)
-                target_table.canvas.yview_moveto(args[0])
-                target_table._update_view()
-        finally:
-            self._scrolling = False
-
-    def sync_scroll_x(self, source_table, *args):
-        """同步水平滚动（如果开启）"""
-        if self._scrolling:
-            return
-            
-        self._scrolling = True
-        try:
-            # 更新源表格的滚动条
-            source_table.hsb.set(*args)
-            source_table._update_view()
-            
-            # 如果开启了同步，更新另一个表格
-            if self.sync_h_scroll.get():
-                target_table = self.table_right if source_table == self.table_left else self.table_left
-                target_table.hsb.set(*args)
-                target_table.canvas.xview_moveto(args[0])
-                target_table._update_view()
-        finally:
-            self._scrolling = False
-
-    def sync_freeze_rows(self, *args):
-        """同步左右表格的冻结行设置"""
-        val = self.freeze_rows.get()
-        self.table_left.freeze_rows.set(val)
-        self.table_right.freeze_rows.set(val)
-        self.update_tables_view()
-
-    def sync_freeze_cols(self, *args):
-        """同步左右表格的冻结列设置"""
-        val = self.freeze_cols.get()
-        self.table_left.freeze_cols.set(val)
-        self.table_right.freeze_cols.set(val)
-        self.update_tables_view()
-
-    def on_row_height_change(self, value):
-        """行高改变"""
-        h = int(float(value))
-        self.row_height_label.config(text=f"{h}px")
+        # 差异明细面板
+        self.detail_container = QtWidgets.QGroupBox("当前行差异明细")
+        detail_layout = QtWidgets.QVBoxLayout(self.detail_container)
+        self.detail_text = QtWidgets.QTextEdit()
+        self.detail_text.setReadOnly(True)
+        detail_layout.addWidget(self.detail_text)
+        self.splitter.addWidget(self.detail_container)
+        self.detail_container.hide()
         
-        # 更新所有行的基础行高
-        if hasattr(self.table_left, 'row_heights') and self.table_left.row_heights:
-            self.table_left.row_heights = [h] * len(self.table_left.row_heights)
-            self.table_right.row_heights = [h] * len(self.table_right.row_heights)
-            
-        self.table_left.row_height = h
-        self.table_right.row_height = h
-        self.update_tables_view()
-
-    def on_col_width_change(self, value):
-        """全局列宽缩放改变"""
-        factor = float(value)
-        self.col_width_label.config(text=f"{int(factor * 100)}%")
+        compare_tab_layout.addWidget(self.splitter)
+        self.tab_widget.addTab(self.compare_tab, "双窗同步比对")
         
-        # 基于原始基础宽度进行缩放
-        if hasattr(self.table_left, 'base_col_widths') and self.table_left.base_col_widths:
-            self.table_left.col_widths = [int(w * factor) for w in self.table_left.base_col_widths]
-            self.table_right.col_widths = [int(w * factor) for w in self.table_right.base_col_widths]
-            self.update_tables_view()
-
-    def update_tables_view(self):
-        """更新左右表格的视图"""
-        # 更新滚动区域
-        self.table_left._update_scroll_region()
-        self.table_right._update_scroll_region()
-        # 强制重新渲染可见区域
-        self.table_left._update_view()
-        self.table_right._update_view()
-
-    def toggle_key_mode(self):
-        """切换关键列比对模式"""
-        if self.key_mode_var.get():
-            self.btn_select_keys.config(state=tk.NORMAL)
-        else:
-            self.btn_select_keys.config(state=tk.DISABLED)
-            self.key_columns = []
-            self.key_cols_label.config(text="未选择关键列")
-
-    def select_key_columns(self):
-        """打开对话框选择关键列"""
-        file1 = self.file1_path.get()
-        sheet1 = self.sheet_combo1.get()
+        # Tab 2: 差异项列表 (只显示有差异的行)
+        self.diff_tab = QtWidgets.QWidget()
+        diff_tab_layout = QtWidgets.QVBoxLayout(self.diff_tab)
+        self.diff_table = QtWidgets.QTableView()
+        self.diff_table.setAlternatingRowColors(True)
+        diff_tab_layout.addWidget(self.diff_table)
+        self.tab_widget.addTab(self.diff_tab, "差异项总览")
         
-        if not file1 or not sheet1:
-            messagebox.showwarning("提示", "请先选择文件和 Sheet 以获取列信息")
-            return
-            
-        try:
-            # 临时读取表头
-            df = ExcelDiffer.read_excel_raw(file1, sheet1, handle_merged=False)
-            columns = list(df.columns)
-            
-            # 创建选择窗口
-            top = tk.Toplevel(self.root)
-            top.title("选择关键列 (可多选)")
-            top.geometry("600x500")
-            top.transient(self.root)
-            top.grab_set()
-            
-            # 居中
-            x = self.root.winfo_x() + (self.root.winfo_width() - 600) // 2
-            y = self.root.winfo_y() + (self.root.winfo_height() - 500) // 2
-            top.geometry(f"+{x}+{y}")
-            
-            main_v_frame = ttk.Frame(top, padding=10)
-            main_v_frame.pack(fill=tk.BOTH, expand=True)
-            
-            ttk.Label(main_v_frame, text="请勾选作为主键的列：", font=('Microsoft YaHei', 10, 'bold')).pack(pady=(0, 10))
-            
-            # 使用带滚动条的列表显示复选框
-            list_frame = ttk.Frame(main_v_frame)
-            list_frame.pack(fill=tk.BOTH, expand=True)
+        main_layout.addWidget(self.tab_widget)
 
-            canvas = tk.Canvas(list_frame, highlightthickness=0)
-            scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
-            scrollable_frame = ttk.Frame(canvas)
-
-            scrollable_frame.bind(
-                "<Configure>",
-                lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-            )
-
-            # 让 canvas 宽度自适应
-            canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-            def on_canvas_configure(event):
-                canvas.itemconfig(canvas_window, width=event.width)
-            canvas.bind('<Configure>', on_canvas_configure)
-
-            canvas.configure(yscrollcommand=scrollbar.set)
-
-            check_vars = {}
-            # 每行显示 3 列
-            num_cols = 3
-            for i, col in enumerate(columns):
-                var = tk.BooleanVar(value=(col in self.key_columns))
-                check_vars[col] = var
-                cb = ttk.Checkbutton(scrollable_frame, text=col, variable=var)
-                cb.grid(row=i // num_cols, column=i % num_cols, sticky=tk.W, padx=10, pady=5)
-            
-            # 设置列权重，使列等宽
-            for c in range(num_cols):
-                scrollable_frame.grid_columnconfigure(c, weight=1)
-
-            canvas.pack(side="left", fill="both", expand=True)
-            scrollbar.pack(side="right", fill="y")
-
-            def on_confirm():
-                selected = [col for col, var in check_vars.items() if var.get()]
-                if not selected:
-                    if not messagebox.askyesno("提示", "未选择任何关键列，是否关闭主键模式？"):
-                        return
-                    self.key_mode_var.set(False)
-                    self.toggle_key_mode()
-                else:
-                    self.key_columns = selected
-                    self.key_cols_label.config(text=f"已选: {', '.join(selected[:2])}{'...' if len(selected) > 2 else ''}")
-                top.destroy()
-
-            ttk.Button(main_v_frame, text="确定", command=on_confirm).pack(pady=10)
-            
-        except Exception as e:
-            messagebox.showerror("错误", f"获取列信息失败: {e}")
-
-    def browse_file(self, file_num):
-        filename = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
-        if filename:
-            if file_num == 1:
-                self.file1_path.set(filename)
-                self.load_sheets(filename, self.sheet_combo1)
-            else:
-                self.file2_path.set(filename)
-                self.load_sheets(filename, self.sheet_combo2)
-
-    def load_sheets(self, filepath, combo_box):
-        try:
-            sheets = ExcelDiffer.load_sheets(filepath)
-            combo_box['values'] = sheets
-            if sheets:
-                combo_box.current(0)
-        except Exception as e:
-            messagebox.showerror("错误", str(e))
-
-    def compare_files(self):
-        file1 = self.file1_path.get()
-        file2 = self.file2_path.get()
-        sheet1 = self.sheet_combo1.get()
-        sheet2 = self.sheet_combo2.get()
-
-        if not file1 or not file2:
-            messagebox.showwarning("提示", "请先选择两个 Excel 文件")
-            return
+        # 3. 底部状态与图例
+        bottom_layout = QtWidgets.QHBoxLayout()
+        legend_layout = QtWidgets.QHBoxLayout()
+        legend_layout.addWidget(self.create_legend_label("新增", "#CCFFCC"))
+        legend_layout.addWidget(self.create_legend_label("删除", "#FFFFCC"))
+        legend_layout.addWidget(self.create_legend_label("修改", "#E6F3FF"))
+        legend_layout.addWidget(self.create_legend_label("单元格差异", "#FFCCCC", "#CC0000"))
+        bottom_layout.addLayout(legend_layout)
         
-        if not sheet1 or not sheet2:
-            messagebox.showwarning("提示", "请选择要比对的 Sheet")
-            return
-
-        # 获取关键列配置
-        key_cols = self.key_columns if self.key_mode_var.get() else None
-        if self.key_mode_var.get() and not key_cols:
-            messagebox.showwarning("提示", "您开启了主键比对模式，但未选择任何关键列。")
-            return
-
-        # 显示加载弹窗
-        self.loading = LoadingDialog(self.root, message="正在读取文件并比对差异，请稍候...")
+        bottom_layout.addStretch()
         
-        # 禁用按钮
-        self.btn_compare.config(state=tk.DISABLED)
-
-        # 开启线程执行比对
-        thread = threading.Thread(target=self._compare_thread_task, args=(file1, file2, sheet1, sheet2, key_cols))
-        thread.daemon = True
-        thread.start()
-
-    def change_theme(self, event=None):
-        """切换界面主题"""
-        theme = self.theme_combo.get()
-        style = ttk.Style()
-        style.theme_use(theme)
-        # 切换主题后重新设置一些自定义样式
-        self.setup_styles()
-
-    def _compare_thread_task(self, file1, file2, sheet1, sheet2, key_cols=None):
-        """后台线程执行比对任务 - 增加进度反馈"""
-        try:
-            # 1. 读取数据
-            self.loading.update_progress(10, "正在读取文件 1...")
-            df1 = ExcelDiffer.read_excel_raw(file1, sheet1, handle_merged=True)
-            
-            self.loading.update_progress(30, "正在读取文件 2...")
-            df2 = ExcelDiffer.read_excel_raw(file2, sheet2, handle_merged=True)
-            
-            # 2. 执行比对
-            self.loading.update_progress(50, f"正在进行{'主键' if key_cols else '序列'}比对...")
-            columns, results = ExcelDiffer.compare_dataframes(df1, df2, key_columns=key_cols)
-            
-            # 3. 准备渲染
-            total_rows = len(results)
-            self.loading.update_progress(80, f"比对完成，正在准备渲染 {total_rows} 行数据...")
-            
-            # 回到主线程更新 UI
-            self.root.after(0, lambda: self._update_ui_after_compare(columns, results))
-
-        except Exception as e:
-            self.root.after(0, lambda: self._handle_compare_error(str(e)))
-
-    def _update_ui_after_compare(self, columns, results):
-        """比对完成后在主线程更新 UI"""
-        self.last_columns = columns
-        self.last_results = results
+        # 缩放控制
+        scale_layout = QtWidgets.QHBoxLayout()
+        self.row_height_spin = QtWidgets.QSpinBox()
+        self.row_height_spin.setRange(20, 150)
+        self.row_height_spin.setValue(30)
+        self.col_width_spin = QtWidgets.QDoubleSpinBox()
+        self.col_width_spin.setRange(0.5, 3.0)
+        self.col_width_spin.setSingleStep(0.1)
+        self.col_width_spin.setValue(1.0)
+        self.row_height_spin.valueChanged.connect(self.apply_row_height)
+        self.col_width_spin.valueChanged.connect(self.apply_column_widths)
+        scale_layout.addWidget(QtWidgets.QLabel("行高:"))
+        scale_layout.addWidget(self.row_height_spin)
+        scale_layout.addWidget(QtWidgets.QLabel("列宽系数:"))
+        scale_layout.addWidget(self.col_width_spin)
+        bottom_layout.addLayout(scale_layout)
         
-        # 关闭加载弹窗
-        if hasattr(self, 'loading'):
-            self.loading.close()
-        
-        # 恢复按钮状态
-        self.btn_compare.config(state=tk.NORMAL)
-        
-        # 展示结果
-        self.show_diff(columns, results)
-        
-        messagebox.showinfo("完成", f"比对完成！共发现 {len(results)} 行差异。")
+        main_layout.addLayout(bottom_layout)
 
-    def _handle_compare_error(self, error_msg):
-        """处理比对过程中的错误（主线程）"""
-        # 关闭加载弹窗
-        if hasattr(self, 'loading'):
-            self.loading.close()
-            
-        self.btn_compare.config(state=tk.NORMAL)
-        messagebox.showerror("错误", f"比对过程中发生错误: {error_msg}")
-
-    def show_diff(self, columns, results):
-        """在两个自定义表格中展示比对结果"""
-        left_data = [r[0] for r in results]
-        right_data = [r[1] for r in results]
-        tags_list = [r[2] for r in results]
-        
-        self.table_left.set_data(columns, left_data, tags_list)
-        self.table_right.set_data(columns, right_data, tags_list)
-
-    def export_results(self):
-        """将缓存的比对结果导出到 Excel"""
-        if self.last_columns is None or self.last_results is None:
-            messagebox.showwarning("提示", "没有可导出的比对结果")
-            return
-            
-        output_path = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Excel files", "*.xlsx")],
-            initialfile="比对结果.xlsx"
+        # 滚动同步绑定
+        self.left_table.verticalScrollBar().valueChanged.connect(
+            lambda v: self.sync_scroll(self.left_table, self.right_table, v, "v")
         )
-        
-        if not output_path:
-            return
-            
-        try:
-            ExcelDiffer.export_diff(output_path, self.last_columns, self.last_results)
-            messagebox.showinfo("成功", f"结果已成功导出至:\n{output_path}")
-        except Exception as e:
-            messagebox.showerror("错误", f"导出失败: {e}")
-
-    def get_resource_path(self, relative_path):
-        """获取资源文件的绝对路径，兼容开发环境和 PyInstaller 打包环境"""
-        if hasattr(sys, '_MEIPASS'):
-            # PyInstaller 打包后的临时目录
-            return os.path.join(sys._MEIPASS, relative_path)
-        
-        # 开发环境：图标在项目根目录的 assets 目录下
-        # 当前文件在 src/ui/，向上两级到项目根目录
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(os.path.dirname(base_path)) 
-        return os.path.join(project_root, "assets", relative_path)
+        self.right_table.verticalScrollBar().valueChanged.connect(
+            lambda v: self.sync_scroll(self.right_table, self.left_table, v, "v")
+        )
+        self.left_table.horizontalScrollBar().valueChanged.connect(
+            lambda v: self.sync_scroll(self.left_table, self.right_table, v, "h")
+        )
+        self.right_table.horizontalScrollBar().valueChanged.connect(
+            lambda v: self.sync_scroll(self.right_table, self.left_table, v, "h")
+        )
 
     def set_window_icon(self):
-        """根据全平台兼容方案设置窗口图标"""
         icon_path = self.get_resource_path("excel.ico")
-        
-        if not os.path.exists(icon_path):
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QtGui.QIcon(icon_path))
+
+    def create_legend_label(self, text, bg_color, fg_color="#000000"):
+        label = QtWidgets.QLabel(text)
+        label.setAlignment(QtCore.Qt.AlignCenter)
+        label.setStyleSheet(f"background:{bg_color}; color:{fg_color}; padding:2px 6px; border:1px solid #cccccc;")
+        return label
+
+    def get_resource_path(self, relative_path):
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(os.path.dirname(base_path))
+        return os.path.join(project_root, "assets", relative_path)
+
+    def toggle_key_mode(self, checked):
+        self.key_btn.setEnabled(checked)
+        if not checked:
+            self.key_columns = []
+            self.key_label.setText("未选择关键列")
+
+    def select_key_columns(self):
+        file1 = self.file1_edit.text().strip()
+        sheet1 = self.sheet_combo1.currentText()
+        if not file1 or not sheet1:
+            QtWidgets.QMessageBox.warning(self, "提示", "请先选择文件和 Sheet 以获取列信息")
+            return
+        try:
+            df = ExcelDiffer.read_excel_raw(file1, sheet1, handle_merged=False)
+            columns = list(df.columns)
+            dialog = KeyColumnsDialog(columns, self.key_columns, self)
+            if dialog.exec_() == QtWidgets.QDialog.Accepted:
+                selected = dialog.selected_columns()
+                if not selected:
+                    self.key_mode_cb.setChecked(False)
+                    self.toggle_key_mode(False)
+                else:
+                    self.key_columns = selected
+                    label_text = "已选: " + ", ".join(selected[:2])
+                    if len(selected) > 2:
+                        label_text += "..."
+                    self.key_label.setText(label_text)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "错误", f"获取列信息失败: {e}")
+
+    def browse_file(self, index):
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "选择 Excel 文件", "", "Excel files (*.xlsx *.xls)")
+        if not file_path:
+            return
+        if index == 1:
+            self.file1_edit.setText(file_path)
+            self.load_sheets(file_path, self.sheet_combo1)
+        else:
+            self.file2_edit.setText(file_path)
+            self.load_sheets(file_path, self.sheet_combo2)
+
+    def load_sheets(self, filepath, combo):
+        try:
+            sheets = ExcelDiffer.load_sheets(filepath)
+            combo.clear()
+            combo.addItems(sheets)
+            if sheets:
+                combo.setCurrentIndex(0)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "错误", str(e))
+
+    def compare_files(self):
+        file1 = self.file1_edit.text().strip()
+        file2 = self.file2_edit.text().strip()
+        sheet1 = self.sheet_combo1.currentText()
+        sheet2 = self.sheet_combo2.currentText()
+        if not file1 or not file2:
+            QtWidgets.QMessageBox.warning(self, "提示", "请先选择两个 Excel 文件")
+            return
+        if not sheet1 or not sheet2:
+            QtWidgets.QMessageBox.warning(self, "提示", "请选择要比对的 Sheet")
+            return
+        key_cols = self.key_columns if self.key_mode_cb.isChecked() else None
+        if self.key_mode_cb.isChecked() and not key_cols:
+            QtWidgets.QMessageBox.warning(self, "提示", "已开启主键比对模式，但未选择关键列")
             return
 
-        # 1. 基础方式：设置标题栏图标
-        try:
-            self.root.iconbitmap(icon_path)
-        except Exception:
-            pass
+        self.compare_btn.setEnabled(False)
+        self.progress_dialog = QtWidgets.QProgressDialog("正在处理中...", "", 0, 100, self)
+        self.progress_dialog.setWindowTitle("请稍候")
+        self.progress_dialog.setWindowModality(QtCore.Qt.ApplicationModal)
+        self.progress_dialog.setAutoClose(False)
+        self.progress_dialog.setAutoReset(False)
+        self.progress_dialog.show()
 
-        # 2. 现代方式：设置任务栏和多分辨率图标 (需安装 Pillow)
-        try:
-            img = Image.open(icon_path)
-            photo = ImageTk.PhotoImage(img)
-            self.root.iconphoto(True, photo)
-            # 注意：必须保留 photo 的引用，否则会被垃圾回收导致图标消失
-            self.root._icon_photo = photo 
-        except Exception:
-            pass
+        self.worker_thread = QtCore.QThread()
+        self.worker = CompareWorker(file1, file2, sheet1, sheet2, key_cols)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.on_compare_finished)
+        self.worker.error.connect(self.on_compare_error)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.error.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.start()
 
-        # 3. Windows 底层方式：强行刷新任务栏图标
-        if os.name == 'nt':
-            try:
-                hwnd = self.root.winfo_id()
-                # 加载图标资源
-                hicon = ctypes.windll.user32.LoadImageW(
-                    None, icon_path, 1, 0, 0, 0x0010 | 0x0040
-                )
-                if hicon:
-                    # 发送消息设置大图标(1)和小图标(0)
-                    ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 0, hicon)
-                    ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 1, hicon)
-            except Exception:
-                pass
+    def update_progress(self, value, text):
+        if self.progress_dialog:
+            self.progress_dialog.setValue(value)
+            self.progress_dialog.setLabelText(text)
+
+    def on_compare_finished(self, columns, results):
+        if self.progress_dialog:
+            self.progress_dialog.close()
+        self.compare_btn.setEnabled(True)
+        self.search_edit.setText("")
+        self.filter_combo.setCurrentIndex(0)
+        self.update_tables_data(columns, results, update_cache=True)
+        
+        # 统计真实差异行数
+        diff_count = len([r for r in results if r[0][0] != "一致"])
+        if diff_count > 0:
+            QtWidgets.QMessageBox.information(self, "完成", f"比对完成！共发现 {diff_count} 行差异。")
+        else:
+            QtWidgets.QMessageBox.information(self, "完成", "比对完成！未发现任何差异。")
+
+    def on_compare_error(self, message):
+        if self.progress_dialog:
+            self.progress_dialog.close()
+        self.compare_btn.setEnabled(True)
+        QtWidgets.QMessageBox.critical(self, "错误", f"比对过程中发生错误: {message}")
+
+    def update_tables_data(self, columns, results, update_cache):
+        if update_cache:
+            self.last_columns = columns
+            self.all_results = results
+        self.display_results = results
+
+        row_count = len(results)
+        col_count = len(columns)
+        
+        # 创建模型
+        left_model = QtGui.QStandardItemModel(row_count, col_count, self)
+        right_model = QtGui.QStandardItemModel(row_count, col_count, self)
+        left_model.setHorizontalHeaderLabels(columns)
+        right_model.setHorizontalHeaderLabels(columns)
+
+        # 准备差异汇总表 (Tab 2)
+        # 差异汇总表只显示非“一致”的行，且左右数据合并显示或采用某种方式
+        # 这里我们采用：[状态, 列名, 旧值, 新值] 的纵向展开模式，或者简单的左右并排
+        # 为了简单且直观，我们先实现过滤后的并排显示
+        diff_only_results = [r for r in results if r[0][0] != "一致"]
+        diff_row_count = len(diff_only_results)
+        # 差异汇总表列：[状态, 列1(旧), 列1(新), 列2(旧), 列2(新)...] 这种太宽了
+        # 还是保持 [状态, 列1, 列2...] 但左右数据都在一个表里？
+        # 考虑到用户习惯，Tab 2 我们显示一个包含所有差异信息的宽表
+        diff_columns = ["状态"]
+        for col in columns[1:]:
+            diff_columns.extend([f"{col}(旧)", f"{col}(新)"])
+        
+        diff_model = QtGui.QStandardItemModel(diff_row_count, len(diff_columns), self)
+        diff_model.setHorizontalHeaderLabels(diff_columns)
+
+        added_color = QtGui.QColor("#CCFFCC")
+        deleted_color = QtGui.QColor("#FFFFCC")
+        modified_color = QtGui.QColor("#E6F3FF")
+        diff_color = QtGui.QColor("#FFCCCC")
+        diff_text_color = QtGui.QColor("#CC0000")
+
+        # 填充双窗模型
+        for r_idx, (left_vals, right_vals, tags) in enumerate(results):
+            row_added = "added" in tags
+            row_deleted = "deleted" in tags
+            row_modified = "modified" in tags
+            for c_idx in range(col_count):
+                l_val = left_vals[c_idx] if c_idx < len(left_vals) else ""
+                r_val = right_vals[c_idx] if c_idx < len(right_vals) else ""
+                l_text, l_diff = self.normalize_value(l_val)
+                r_text, r_diff = self.normalize_value(r_val)
+                l_item = QtGui.QStandardItem(l_text)
+                r_item = QtGui.QStandardItem(r_text)
+                if row_deleted:
+                    l_item.setBackground(deleted_color)
+                if row_added:
+                    r_item.setBackground(added_color)
+                if row_modified and c_idx == 0:
+                    l_item.setBackground(modified_color)
+                    r_item.setBackground(modified_color)
+                if l_diff:
+                    l_item.setBackground(diff_color)
+                    l_item.setForeground(diff_text_color)
+                if r_diff:
+                    r_item.setBackground(diff_color)
+                    r_item.setForeground(diff_text_color)
+                left_model.setItem(r_idx, c_idx, l_item)
+                right_model.setItem(r_idx, c_idx, r_item)
+
+        # 填充差异汇总模型 (Tab 2)
+        for r_idx, (left_vals, right_vals, tags) in enumerate(diff_only_results):
+            status = left_vals[0]
+            status_item = QtGui.QStandardItem(status)
+            if "added" in tags: status_item.setBackground(added_color)
+            elif "deleted" in tags: status_item.setBackground(deleted_color)
+            elif "modified" in tags: status_item.setBackground(modified_color)
+            diff_model.setItem(r_idx, 0, status_item)
+            
+            for c_idx in range(1, col_count):
+                l_val = left_vals[c_idx] if c_idx < len(left_vals) else ""
+                r_val = right_vals[c_idx] if c_idx < len(right_vals) else ""
+                l_text, l_diff = self.normalize_value(l_val)
+                r_text, r_diff = self.normalize_value(r_val)
+                
+                l_item = QtGui.QStandardItem(l_text)
+                r_item = QtGui.QStandardItem(r_text)
+                
+                if l_diff:
+                    l_item.setBackground(diff_color)
+                    l_item.setForeground(diff_text_color)
+                if r_diff:
+                    r_item.setBackground(diff_color)
+                    r_item.setForeground(diff_text_color)
+                
+                diff_model.setItem(r_idx, (c_idx-1)*2 + 1, l_item)
+                diff_model.setItem(r_idx, (c_idx-1)*2 + 2, r_item)
+
+        self.left_table.setModel(left_model)
+        self.right_table.setModel(right_model)
+        self.diff_table.setModel(diff_model)
+        self.left_model = left_model
+        self.right_model = right_model
+        
+        # 调整 Tab 2 列宽
+        self.diff_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        
+        self.apply_row_height(self.row_height_spin.value())
+        self.compute_base_widths(columns, results)
+        self.apply_column_widths(self.col_width_spin.value())
+        self.connect_selection()
+        self.clear_detail_panel()
+
+    def normalize_value(self, value):
+        text = str(value)
+        if text.startswith(">>> ") and text.endswith(" <<<"):
+            return text[4:-4], True
+        return text, False
+
+    def compute_base_widths(self, columns, results):
+        if not columns:
+            self.base_col_widths = []
+            return
+        metrics = QtGui.QFontMetrics(self.left_table.font())
+        max_widths = [metrics.horizontalAdvance(str(col)) for col in columns]
+        sample_size = min(len(results), 300)
+        for i in range(sample_size):
+            left_vals, right_vals, _ = results[i]
+            for col_idx in range(len(columns)):
+                l_text, _ = self.normalize_value(left_vals[col_idx] if col_idx < len(left_vals) else "")
+                r_text, _ = self.normalize_value(right_vals[col_idx] if col_idx < len(right_vals) else "")
+                max_widths[col_idx] = max(max_widths[col_idx], metrics.horizontalAdvance(l_text))
+                max_widths[col_idx] = max(max_widths[col_idx], metrics.horizontalAdvance(r_text))
+        self.base_col_widths = [min(w + 30, 600) for w in max_widths]
+
+    def apply_row_height(self, value):
+        row_height = int(value)
+        for t in [self.left_table, self.right_table, self.diff_table]:
+            t.verticalHeader().setDefaultSectionSize(row_height)
+
+    def apply_column_widths(self, value):
+        if not self.base_col_widths:
+            return
+        factor = float(value)
+        for i, base_w in enumerate(self.base_col_widths):
+            width = int(base_w * factor)
+            self.left_table.setColumnWidth(i, width)
+            self.right_table.setColumnWidth(i, width)
+        # 差异汇总表不使用基础宽度，因为它列结构不同
+        # self.diff_table.update_frozen_geometry()
+
+    def connect_selection(self):
+        if self.left_table.selectionModel():
+            self.left_table.selectionModel().selectionChanged.connect(self.on_left_selection)
+        if self.right_table.selectionModel():
+            self.right_table.selectionModel().selectionChanged.connect(self.on_right_selection)
+
+    def on_left_selection(self, selected, deselected):
+        if self._syncing_selection:
+            return
+        indexes = self.left_table.selectionModel().selectedIndexes()
+        if not indexes:
+            return
+        index = indexes[0]
+        self._syncing_selection = True
+        if self.right_model:
+            self.right_table.setCurrentIndex(self.right_model.index(index.row(), index.column()))
+        self._syncing_selection = False
+        self.update_detail_panel(index.row())
+
+    def on_right_selection(self, selected, deselected):
+        if self._syncing_selection:
+            return
+        indexes = self.right_table.selectionModel().selectedIndexes()
+        if not indexes:
+            return
+        index = indexes[0]
+        self._syncing_selection = True
+        if self.left_model:
+            self.left_table.setCurrentIndex(self.left_model.index(index.row(), index.column()))
+        self._syncing_selection = False
+        self.update_detail_panel(index.row())
+
+    def sync_scroll(self, source, target, value, axis):
+        if self._syncing_scroll:
+            return
+        if axis == "v" and not self.sync_v_cb.isChecked():
+            return
+        if axis == "h" and not self.sync_h_cb.isChecked():
+            return
+        self._syncing_scroll = True
+        if axis == "v":
+            target.verticalScrollBar().setValue(value)
+        else:
+            target.horizontalScrollBar().setValue(value)
+        self._syncing_scroll = False
+
+    def apply_filter(self):
+        if not self.all_results or not self.last_columns:
+            return
+        search_kw = self.search_edit.text().strip().lower()
+        filter_status = self.filter_combo.currentText()
+        filtered = []
+        for left_vals, right_vals, tags in self.all_results:
+            status = left_vals[0] if left_vals else ""
+            if filter_status != "全部" and status != filter_status:
+                continue
+            if search_kw:
+                found = False
+                for val in left_vals:
+                    text, _ = self.normalize_value(val)
+                    if search_kw in text.lower():
+                        found = True
+                        break
+                if not found:
+                    for val in right_vals:
+                        text, _ = self.normalize_value(val)
+                        if search_kw in text.lower():
+                            found = True
+                            break
+                if not found:
+                    continue
+            filtered.append((left_vals, right_vals, tags))
+        self.update_tables_data(self.last_columns, filtered, update_cache=False)
+
+    def toggle_freeze(self, checked):
+        pass
+        # for t in [self.left_table, self.right_table, self.diff_table]:
+        #     t.set_frozen(checked)
+
+    def toggle_detail_panel(self, checked):
+        if checked:
+            self.detail_container.show()
+        else:
+            self.detail_container.hide()
+            self.clear_detail_panel()
+
+    def clear_detail_panel(self):
+        self.detail_text.clear()
+
+    def update_detail_panel(self, row_idx):
+        if not self.display_results or row_idx >= len(self.display_results):
+            return
+        left_data, right_data, tags = self.display_results[row_idx]
+        columns = self.last_columns or []
+        status = left_data[0] if left_data else ""
+        html_parts = []
+        html_parts.append(f"<b>行索引:</b> {row_idx + 1} | <b>状态:</b> {status}<br>")
+        html_parts.append("<hr>")
+        has_diff = False
+        for i in range(1, len(columns)):
+            col_name = columns[i]
+            val1 = left_data[i] if i < len(left_data) else ""
+            val2 = right_data[i] if i < len(right_data) else ""
+            v1_text, v1_diff = self.normalize_value(val1)
+            v2_text, v2_diff = self.normalize_value(val2)
+            is_diff = v1_diff or v2_diff or status in ["新增", "删除"]
+            if not is_diff:
+                continue
+            has_diff = True
+            html_parts.append(f"<b>列:</b> {col_name}<br>")
+            if status == "删除":
+                html_parts.append(f"<span style='color:#CC0000'>旧值:</span> <span style='background:#FFCCCC'>{v1_text}</span><br><br>")
+            elif status == "新增":
+                html_parts.append(f"<span style='color:#CC0000'>新值:</span> <span style='background:#FFCCCC'>{v2_text}</span><br><br>")
+            else:
+                html_parts.append(f"<span style='color:#CC0000'>旧值:</span> <span style='background:#FFCCCC'>{v1_text}</span><br>")
+                html_parts.append(f"<span style='color:#CC0000'>新值:</span> <span style='background:#FFCCCC'>{v2_text}</span><br><br>")
+        if not has_diff:
+            html_parts.append("<span style='color:#666666'>该行内容完全一致，无差异明细。</span>")
+        self.detail_text.setHtml("".join(html_parts))
+
+    def export_results(self):
+        if not self.last_columns or self.all_results is None:
+            QtWidgets.QMessageBox.warning(self, "提示", "没有可导出的比对结果")
+            return
+        output_path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "导出比对结果", "比对结果.xlsx", "Excel files (*.xlsx)")
+        if not output_path:
+            return
+        try:
+            ExcelDiffer.export_diff(output_path, self.last_columns, self.all_results)
+            QtWidgets.QMessageBox.information(self, "成功", f"结果已成功导出至:\n{output_path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "错误", f"导出失败: {e}")
+
+    def show_usage(self):
+        usage_text = (
+            "Excel 差异比对工具 使用说明：\n\n"
+            "1. 选择文件：点击“浏览...”按钮选择需要比对的两个 Excel 文件（旧版本和新版本）。\n"
+            "2. 选择 Sheet：在下拉框中选择要比对的工作表。\n"
+            "3. 设置选项：\n"
+            "   - 纵滚/横滚同步：开启后两侧表格将同步滚动。\n"
+            "4. 开始比对：点击“开始比对差异”按钮，程序将分析差异并在下方展示。\n"
+            "5. 结果说明：\n"
+            "   - 单元格浅红填充：表示内容发生了变化。\n"
+            "   - 行浅绿填充：表示该行为新增行。\n"
+            "   - 行浅黄填充：表示该行为删除行。\n"
+            "6. 导出结果：比对完成后，点击“导出结果”可将差异保存为 Excel 文件。\n\n"
+            "注意：程序默认开启合并单元格自动填充功能，确保比对结果的准确性。"
+        )
+        QtWidgets.QMessageBox.information(self, "使用说明", usage_text)
+
+    def show_version(self):
+        version = self.version
+        details = ""
+        if os.path.exists("updates_notes.txt"):
+            with open("updates_notes.txt", "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            details = "\n".join(lines[:8]).strip()
+        if not details:
+            details = "未找到更新记录。"
+        text = f"Excel 差异比对工具\n\n当前版本：{version}\n\n更新说明：\n{details}"
+        QtWidgets.QMessageBox.information(self, "版本说明", text)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        file_paths = [u.toLocalFile() for u in urls]
+        for path in file_paths:
+            if path.lower().endswith((".xlsx", ".xls")):
+                if not self.file1_edit.text().strip():
+                    self.file1_edit.setText(path)
+                    self.load_sheets(path, self.sheet_combo1)
+                else:
+                    self.file2_edit.setText(path)
+                    self.load_sheets(path, self.sheet_combo2)

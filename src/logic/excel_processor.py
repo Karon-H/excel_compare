@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import openpyxl
 import difflib
@@ -11,50 +12,129 @@ class ExcelDiffer:
     def load_sheets(filepath):
         """读取 Excel 文件的 Sheet 列表"""
         try:
-            xl = pd.ExcelFile(filepath)
+            # 自动识别引擎
+            ext = os.path.splitext(filepath)[1].lower()
+            if ext in ['.xlsx', '.xlsm', '.xltx', '.xltm']:
+                engine = 'openpyxl'
+            elif ext in ['.xls']:
+                engine = 'xlrd'
+            else:
+                engine = None
+            
+            # 使用指定引擎读取，确保与后续读取逻辑一致
+            xl = pd.ExcelFile(filepath, engine=engine)
             return xl.sheet_names
         except Exception as e:
-            raise Exception(f"无法读取 Excel 文件: {e}")
+            # 降级处理：尝试不指定引擎
+            try:
+                xl = pd.ExcelFile(filepath)
+                return xl.sheet_names
+            except:
+                raise Exception(f"无法获取 Excel Sheet 列表: {e}")
 
     @staticmethod
     def read_excel_raw(filepath, sheet_name, handle_merged=True):
         """
-        使用 openpyxl 读取 Excel，保持原始格式和合并单元格信息
+        极致健壮的 Excel 读取逻辑：
+        1. 自动识别引擎，支持多种 Excel 格式
+        2. 智能匹配 Sheet 名称（防止空格、大小写导致的失败）
+        3. 智能表头识别与合并单元格处理
         """
-        wb = openpyxl.load_workbook(filepath, data_only=True, read_only=False)
-        ws = wb[sheet_name]
+        # 自动识别引擎
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext in ['.xlsx', '.xlsm', '.xltx', '.xltm']:
+            engine = 'openpyxl'
+        elif ext in ['.xls']:
+            engine = 'xlrd'
+        else:
+            engine = None
         
-        data = []
-        # 获取合并单元格范围
-        merged_cells = ws.merged_cells.ranges
-        
-        for row in ws.iter_rows(values_only=True):
-            data.append(list(row))
+        # --- 预处理 Sheet 名称 ---
+        # 获取所有实际的 Sheet 名称
+        try:
+            xl = pd.ExcelFile(filepath, engine=engine)
+            actual_sheets = xl.sheet_names
             
-        df = pd.DataFrame(data)
+            # 1. 尝试完全匹配
+            target_sheet = sheet_name
+            if sheet_name not in actual_sheets:
+                # 2. 尝试模糊匹配 (不区分大小写，不区分首尾空格)
+                s_name = str(sheet_name).strip().lower()
+                for s in actual_sheets:
+                    if s.strip().lower() == s_name:
+                        target_sheet = s
+                        break
+        except Exception as e:
+            # 如果获取列表失败，只能盲猜
+            target_sheet = sheet_name
+
+        df = None
         
-        if handle_merged:
-            # 如果需要处理合并单元格，手动填充合并区域的值
-            # openpyxl 的 values_only 模式下，合并单元格只有左上角有值，其余为 None
-            # 我们根据 merged_cells 信息进行填充
-            for merged_range in merged_cells:
-                min_col, min_row, max_col, max_row = range_boundaries(str(merged_range))
-                # 获取左上角的值
-                top_left_value = ws.cell(row=min_row, column=min_col).value
+        # --- 尝试读取 ---
+        try:
+            df = pd.read_excel(filepath, sheet_name=target_sheet, header=None, engine=engine)
+        except Exception as e:
+            # 如果按名称读取失败，记录错误并抛出，不再默认跳回第一个
+            raise Exception(f"读取工作表 '{sheet_name}' 失败: {e}")
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        # --- 合并单元格处理 (仅针对 openpyxl) ---
+        if handle_merged and engine == 'openpyxl':
+            try:
+                wb = openpyxl.load_workbook(filepath, data_only=True)
+                # 使用匹配后的名称
+                ws = None
+                if target_sheet in wb.sheetnames:
+                    ws = wb[target_sheet]
+                else:
+                    # 再次兜底匹配
+                    match = [s for s in wb.sheetnames if s.lower().strip() == str(target_sheet).lower().strip()]
+                    ws = wb[match[0]] if match else wb.worksheets[0]
                 
-                # 在 DataFrame 中填充该范围（注意 DataFrame 索引从 0 开始）
-                for r in range(min_row-1, max_row):
-                    for c in range(min_col-1, max_col):
-                        if r < len(df) and c < len(df.columns):
-                            df.iloc[r, c] = top_left_value
-                            
-        # 移除全空的行和列（可选，但通常 Excel 末尾会有很多空行）
+                if ws:
+                    for merged_range in ws.merged_cells.ranges:
+                        min_col, min_row, max_col, max_row = range_boundaries(str(merged_range))
+                        top_left_value = ws.cell(row=min_row, column=min_col).value
+                        for r in range(min_row-1, max_row):
+                            for c in range(min_col-1, max_col):
+                                if r < len(df) and c < len(df.columns):
+                                    df.iloc[r, c] = top_left_value
+                wb.close()
+            except Exception as merge_err:
+                print(f"合并单元格处理提示: {merge_err}")
+        
+        # --- 移除全空行/列 ---
         df = df.dropna(how='all').dropna(axis=1, how='all')
         
-        # 将第一行作为列名（如果存在）
         if not df.empty:
-            df.columns = [f"列{i+1}" for i in range(len(df.columns))]
+            # --- 智能表头识别 ---
+            header_row_idx = 0
+            for i in range(len(df)):
+                # 寻找第一个包含非空值的行
+                if not df.iloc[i].isna().all():
+                    header_row_idx = i
+                    break
             
+            header_values = df.iloc[header_row_idx]
+            df_data = df.iloc[header_row_idx + 1:]
+            
+            # 处理列名
+            new_columns = []
+            seen = {}
+            for i, val in enumerate(header_values):
+                col_name = str(val).strip() if pd.notna(val) and str(val).strip() != "" else f"列{i+1}"
+                if col_name in seen:
+                    seen[col_name] += 1
+                    col_name = f"{col_name}_{seen[col_name]}"
+                else:
+                    seen[col_name] = 0
+                new_columns.append(col_name)
+            
+            df_data.columns = new_columns
+            return df_data.reset_index(drop=True)
+        
         return df
 
     @staticmethod
@@ -69,6 +149,15 @@ class ExcelDiffer:
         df1 = df1.fillna("")
         df2 = df2.fillna("")
         
+        # 校验主键列是否存在
+        if key_columns:
+            missing_df1 = [col for col in key_columns if col not in df1.columns]
+            missing_df2 = [col for col in key_columns if col not in df2.columns]
+            if missing_df1:
+                raise Exception(f"旧文件中缺少关键列: {', '.join(missing_df1)}")
+            if missing_df2:
+                raise Exception(f"新文件中缺少关键列: {', '.join(missing_df2)}")
+
         # 获取所有列的并集
         all_columns = ["状态"] + list(df1.columns)
         for col in df2.columns:
@@ -83,20 +172,36 @@ class ExcelDiffer:
 
     @staticmethod
     def _compare_by_sequence(df1, df2, data_columns, all_columns):
-        """原有的基于序列对齐的比对逻辑"""
-        # 将 DataFrame 转换为字符串列表进行序列比对
-        rows1 = [tuple(row) for row in df1.values]
-        rows2 = [tuple(row) for row in df2.values]
+        """优化的基于序列对齐的比对逻辑"""
+        # 1. 预计算哈希值，提升序列比对和相等判断速度
+        # 使用 values 数组操作，避免 iloc/get(col) 产生的 KeyError
+        # data_columns 此时包含了新旧文件的列并集，但 df1 或 df2 可能缺失某些列
         
-        matcher = difflib.SequenceMatcher(None, rows1, rows2)
+        def get_row_data(df, target_cols):
+            # 建立一个与 target_cols 对应的空数据行，确保不会出现 KeyError
+            rows = []
+            for _, row in df.iterrows():
+                row_vals = []
+                for col in target_cols:
+                    # 使用 row.get 而非 row[col]，因为 df 可能缺少并集中的某些列
+                    val = row.get(col, "")
+                    row_vals.append(val)
+                rows.append(tuple(row_vals))
+            return rows
+
+        rows1 = get_row_data(df1, data_columns)
+        rows2 = get_row_data(df2, data_columns)
+        
+        # 2. 序列比对
+        matcher = difflib.SequenceMatcher(None, rows1, rows2, autojunk=False)
         results = []
         
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag == 'equal':
+                # 全等块
                 for k in range(i2 - i1):
-                    row = df1.iloc[i1 + k]
-                    vals = [row.get(col, "") for col in data_columns]
-                    results.append((["一致"] + vals, ["一致"] + vals, ['equal']))
+                    row_vals = list(rows1[i1 + k])
+                    results.append((["一致"] + row_vals, ["一致"] + row_vals, ['equal']))
             
             elif tag == 'replace':
                 count1 = i2 - i1
@@ -106,102 +211,133 @@ class ExcelDiffer:
                     has_row1 = k < count1
                     has_row2 = k < count2
                     if has_row1 and has_row2:
-                        row1 = df1.iloc[i1 + k]
-                        row2 = df2.iloc[j1 + k]
-                        l_row, r_row, has_diff = ExcelDiffer._compare_rows(row1, row2, data_columns)
-                        status = "修改" if has_diff else "一致"
-                        results.append(([status] + l_row, [status] + r_row, ['modified' if has_diff else 'equal']))
+                        r1_tuple = rows1[i1 + k]
+                        r2_tuple = rows2[j1 + k]
+                        
+                        if r1_tuple == r2_tuple:
+                            vals = list(r1_tuple)
+                            results.append((["一致"] + vals, ["一致"] + vals, ['equal']))
+                        else:
+                            # 逐列比对，标记 >>> diff <<<
+                            l_row = []
+                            r_row = []
+                            has_diff = False
+                            for v1, v2 in zip(r1_tuple, r2_tuple):
+                                if str(v1).strip() != str(v2).strip():
+                                    l_row.append(f">>> {v1} <<<")
+                                    r_row.append(f">>> {v2} <<<")
+                                    has_diff = True
+                                else:
+                                    l_row.append(str(v1))
+                                    r_row.append(str(v2))
+                            
+                            status = "修改" if has_diff else "一致"
+                            results.append(([status] + l_row, [status] + r_row, ['modified' if has_diff else 'equal']))
                     elif has_row1:
-                        row1 = df1.iloc[i1 + k]
-                        vals = [row1.get(col, "") for col in data_columns]
-                        results.append((["删除"] + vals, ["删除"] + ["" for _ in data_columns], ['deleted']))
+                        row_vals = list(rows1[i1 + k])
+                        results.append((["删除"] + row_vals, ["删除"] + ["" for _ in data_columns], ['deleted']))
                     elif has_row2:
-                        row2 = df2.iloc[j1 + k]
-                        vals = [row2.get(col, "") for col in data_columns]
-                        results.append((["新增"] + ["" for _ in data_columns], ["新增"] + vals, ['added']))
+                        row_vals = list(rows2[j1 + k])
+                        results.append((["新增"] + ["" for _ in data_columns], ["新增"] + row_vals, ['added']))
             
             elif tag == 'delete':
                 for k in range(i1, i2):
-                    row = df1.iloc[k]
-                    vals = [row.get(col, "") for col in data_columns]
-                    results.append((["删除"] + vals, ["删除"] + ["" for _ in data_columns], ['deleted']))
+                    row_vals = list(rows1[k])
+                    results.append((["删除"] + row_vals, ["删除"] + ["" for _ in data_columns], ['deleted']))
             
             elif tag == 'insert':
                 for k in range(j1, j2):
-                    row = df2.iloc[k]
-                    vals = [row.get(col, "") for col in data_columns]
-                    results.append((["新增"] + ["" for _ in data_columns], ["新增"] + vals, ['added']))
+                    row_vals = list(rows2[k])
+                    results.append((["新增"] + ["" for _ in data_columns], ["新增"] + row_vals, ['added']))
                     
         return all_columns, results
 
     @staticmethod
     def _compare_by_keys(df1, df2, key_columns, data_columns, all_columns):
-        """基于关键列的主键比对逻辑"""
-        # 1. 为两个 DF 创建索引字典
-        def get_key(row, keys):
-            return tuple(str(row.get(k, "")) for k in keys)
-
-        dict1 = {get_key(row, key_columns): row for _, row in df1.iterrows()}
-        dict2 = {get_key(row, key_columns): row for _, row in df2.iterrows()}
+        """优化的基于主键的比对逻辑"""
+        # 建立索引，提高查找速度
+        # 使用 set_index 之前，先确保主键列在 df 中存在 (已经在上层 compare_dataframes 校验过)
+        # 这里使用 copy 避免修改原始 DataFrame
+        d1 = df1.copy()
+        d2 = df2.copy()
         
-        # 2. 获取所有的 Key 集合，并保持一定的顺序（以文件2为主，结合文件1）
-        all_keys = []
-        keys1 = list(dict1.keys())
-        keys2 = list(dict2.keys())
-        
-        # 简单的合并策略：先按文件1的顺序放，再放文件2中新增的
-        all_keys = keys1.copy()
-        set_keys1 = set(keys1)
-        for k in keys2:
-            if k not in set_keys1:
-                all_keys.append(k)
-        
-        results = []
-        for k in all_keys:
-            in_1 = k in dict1
-            in_2 = k in dict2
+        # 将主键列转换为字符串，避免类型不匹配
+        for col in key_columns:
+            d1[col] = d1[col].astype(str).str.strip()
+            d2[col] = d2[col].astype(str).str.strip()
             
-            if in_1 and in_2:
-                # 匹配到主键，比对内容
-                row1 = dict1[k]
-                row2 = dict2[k]
-                l_row, r_row, has_diff = ExcelDiffer._compare_rows(row1, row2, data_columns)
+        d1.set_index(key_columns, inplace=True, drop=False)
+        d2.set_index(key_columns, inplace=True, drop=False)
+        
+        # 获取所有主键的并集
+        all_keys = list(d1.index.union(d2.index))
+        results = []
+        
+        for key in all_keys:
+            in_d1 = key in d1.index
+            in_d2 = key in d2.index
+            
+            if in_d1 and in_d2:
+                # 注意：处理重复主键，取第一个
+                r1 = d1.loc[[key]].iloc[0]
+                r2 = d2.loc[[key]].iloc[0]
+                
+                # 逐列比对
+                l_row = []
+                r_row = []
+                has_diff = False
+                
+                for col in data_columns:
+                    v1 = r1.get(col, "")
+                    v2 = r2.get(col, "")
+                    
+                    if str(v1).strip() != str(v2).strip():
+                        l_row.append(f">>> {v1} <<<")
+                        r_row.append(f">>> {v2} <<<")
+                        has_diff = True
+                    else:
+                        l_row.append(str(v1))
+                        r_row.append(str(v2))
+                
                 status = "修改" if has_diff else "一致"
                 results.append(([status] + l_row, [status] + r_row, ['modified' if has_diff else 'equal']))
-            elif in_1:
-                # 只有文件1有 -> 删除
-                row1 = dict1[k]
-                vals = [row1.get(col, "") for col in data_columns]
+                
+            elif in_d1:
+                r1 = d1.loc[[key]].iloc[0]
+                vals = [str(r1.get(col, "")).strip() for col in data_columns]
                 results.append((["删除"] + vals, ["删除"] + ["" for _ in data_columns], ['deleted']))
-            elif in_2:
-                # 只有文件2有 -> 新增
-                row2 = dict2[k]
-                vals = [row2.get(col, "") for col in data_columns]
+                
+            elif in_d2:
+                r2 = d2.loc[[key]].iloc[0]
+                vals = [str(r2.get(col, "")).strip() for col in data_columns]
                 results.append((["新增"] + ["" for _ in data_columns], ["新增"] + vals, ['added']))
                 
         return all_columns, results
 
     @staticmethod
-    def _compare_rows(row1, row2, columns):
-        """内部方法：比对两行数据并标记差异"""
+    def _compare_rows(row1, row2, data_columns):
+        """对比单行数据并标记差异"""
         l_row = []
         r_row = []
         has_diff = False
         
-        for col in columns:
-            val1 = row1.get(col, "")
-            val2 = row2.get(col, "")
+        for col in data_columns:
+            # 兼容处理：如果 row 中缺少某列，则视为空字符串
+            v1 = row1.get(col, "")
+            v2 = row2.get(col, "")
             
-            v1_str = str(val1).strip()
-            v2_str = str(val2).strip()
+            # 忽略空白字符的差异
+            s1 = str(v1).strip()
+            s2 = str(v2).strip()
             
-            if v1_str != v2_str:
-                l_row.append(f">>> {val1} <<<")
-                r_row.append(f">>> {val2} <<<")
+            if s1 != s2:
+                l_row.append(f">>> {v1} <<<")
+                r_row.append(f">>> {v2} <<<")
                 has_diff = True
             else:
-                l_row.append(str(val1))
-                r_row.append(str(val2))
+                l_row.append(str(v1))
+                r_row.append(str(v2))
+                
         return l_row, r_row, has_diff
 
 

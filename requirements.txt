@@ -1,5 +1,3 @@
 pandas
 openpyxl
-ttkbootstrap
-windnd
-Pillow
+PyQt5
