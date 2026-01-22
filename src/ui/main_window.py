@@ -2,6 +2,7 @@ import os
 from PyQt5 import QtWidgets, QtCore, QtGui
 from src.logic.excel_processor import ExcelDiffer
 from src.ui.frozen_table_view import FrozenTableView
+from src.ui.diff_table_model import DiffTableModel
 
 
 class CompareWorker(QtCore.QObject):
@@ -443,110 +444,63 @@ class MainWindow(QtWidgets.QMainWindow):
         row_count = len(results)
         col_count = len(columns)
         
-        # 创建模型
-        left_model = QtGui.QStandardItemModel(row_count, col_count, self)
-        right_model = QtGui.QStandardItemModel(row_count, col_count, self)
-        left_model.setHorizontalHeaderLabels(columns)
-        right_model.setHorizontalHeaderLabels(columns)
+        # 1. 提取数据和差异信息
+        left_data_list = [r[0] for r in results]
+        right_data_list = [r[1] for r in results]
+        diff_infos = [r[2] for r in results]
 
-        # 准备差异汇总表 (Tab 2)
-        # 差异汇总表只显示非“一致”的行，且左右数据合并显示或采用某种方式
-        # 这里我们采用：[状态, 列名, 旧值, 新值] 的纵向展开模式，或者简单的左右并排
-        # 为了简单且直观，我们先实现过滤后的并排显示
-        diff_only_results = [r for r in results if r[0][0] != "一致"]
-        diff_row_count = len(diff_only_results)
-        # 差异汇总表列：[状态, 列1(旧), 列1(新), 列2(旧), 列2(新)...] 这种太宽了
-        # 还是保持 [状态, 列1, 列2...] 但左右数据都在一个表里？
-        # 考虑到用户习惯，Tab 2 我们显示一个包含所有差异信息的宽表
-        diff_columns = ["状态"]
-        for col in columns[1:]:
-            diff_columns.extend([f"{col}(旧)", f"{col}(新)"])
+        # 2. 创建并设置自定义模型 (Tab 1)
+        left_model = DiffTableModel(left_data_list, columns, diff_infos, role_type="left", parent=self)
+        right_model = DiffTableModel(right_data_list, columns, diff_infos, role_type="right", parent=self)
         
-        diff_model = QtGui.QStandardItemModel(diff_row_count, len(diff_columns), self)
-        diff_model.setHorizontalHeaderLabels(diff_columns)
-
-        added_color = QtGui.QColor("#CCFFCC")
-        deleted_color = QtGui.QColor("#FFFFCC")
-        modified_color = QtGui.QColor("#E6F3FF")
-        diff_color = QtGui.QColor("#FFCCCC")
-        diff_text_color = QtGui.QColor("#CC0000")
-
-        # 填充双窗模型
-        for r_idx, (left_vals, right_vals, tags) in enumerate(results):
-            row_added = "added" in tags
-            row_deleted = "deleted" in tags
-            row_modified = "modified" in tags
-            for c_idx in range(col_count):
-                l_val = left_vals[c_idx] if c_idx < len(left_vals) else ""
-                r_val = right_vals[c_idx] if c_idx < len(right_vals) else ""
-                l_text, l_diff = self.normalize_value(l_val)
-                r_text, r_diff = self.normalize_value(r_val)
-                l_item = QtGui.QStandardItem(l_text)
-                r_item = QtGui.QStandardItem(r_text)
-                if row_deleted:
-                    l_item.setBackground(deleted_color)
-                if row_added:
-                    r_item.setBackground(added_color)
-                if row_modified and c_idx == 0:
-                    l_item.setBackground(modified_color)
-                    r_item.setBackground(modified_color)
-                if l_diff:
-                    l_item.setBackground(diff_color)
-                    l_item.setForeground(diff_text_color)
-                if r_diff:
-                    r_item.setBackground(diff_color)
-                    r_item.setForeground(diff_text_color)
-                left_model.setItem(r_idx, c_idx, l_item)
-                right_model.setItem(r_idx, c_idx, r_item)
-
-        # 填充差异汇总模型 (Tab 2)
-        for r_idx, (left_vals, right_vals, tags) in enumerate(diff_only_results):
-            status = left_vals[0]
-            status_item = QtGui.QStandardItem(status)
-            if "added" in tags: status_item.setBackground(added_color)
-            elif "deleted" in tags: status_item.setBackground(deleted_color)
-            elif "modified" in tags: status_item.setBackground(modified_color)
-            diff_model.setItem(r_idx, 0, status_item)
-            
-            for c_idx in range(1, col_count):
-                l_val = left_vals[c_idx] if c_idx < len(left_vals) else ""
-                r_val = right_vals[c_idx] if c_idx < len(right_vals) else ""
-                l_text, l_diff = self.normalize_value(l_val)
-                r_text, r_diff = self.normalize_value(r_val)
-                
-                l_item = QtGui.QStandardItem(l_text)
-                r_item = QtGui.QStandardItem(r_text)
-                
-                if l_diff:
-                    l_item.setBackground(diff_color)
-                    l_item.setForeground(diff_text_color)
-                if r_diff:
-                    r_item.setBackground(diff_color)
-                    r_item.setForeground(diff_text_color)
-                
-                diff_model.setItem(r_idx, (c_idx-1)*2 + 1, l_item)
-                diff_model.setItem(r_idx, (c_idx-1)*2 + 2, r_item)
-
         self.left_table.setModel(left_model)
         self.right_table.setModel(right_model)
-        self.diff_table.setModel(diff_model)
         self.left_model = left_model
         self.right_model = right_model
+
+        # 3. 准备差异汇总表 (Tab 2)
+        diff_only_results = [r for r in results if r[2]['status'] != "equal"]
         
-        # 调整 Tab 2 列宽
+        # 差异汇总表列：[状态, 列1(旧), 列1(新), 列2(旧), 列2(新)...]
+        diff_summary_columns = ["状态"]
+        for col in columns[1:]:
+            diff_summary_columns.extend([f"{col}(旧)", f"{col}(新)"])
+        
+        # 构建差异汇总表的数据和特殊的 diff_infos
+        diff_summary_data = []
+        diff_summary_infos = []
+        
+        for left_vals, right_vals, info in diff_only_results:
+            row_data = [info['status']]
+            # 对于汇总表，我们需要映射 diff_cols
+            new_diff_cols = []
+            
+            for c_idx in range(1, col_count):
+                l_val = left_vals[c_idx]
+                r_val = right_vals[c_idx]
+                row_data.extend([l_val, r_val])
+                
+                # 如果该原始列有差异，标记汇总表中的这两个子列
+                if c_idx in info.get('diff_cols', []):
+                    new_diff_cols.append((c_idx-1)*2 + 1)
+                    new_diff_cols.append((c_idx-1)*2 + 2)
+            
+            diff_summary_data.append(row_data)
+            diff_summary_infos.append({
+                'status': info['status'],
+                'diff_cols': new_diff_cols
+            })
+
+        diff_model = DiffTableModel(diff_summary_data, diff_summary_columns, diff_summary_infos, role_type="diff", parent=self)
+        self.diff_table.setModel(diff_model)
+        
+        # 4. 界面调整
         self.diff_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        
         self.apply_row_height(self.row_height_spin.value())
         self.compute_base_widths(columns, results)
         self.apply_column_widths(self.col_width_spin.value())
         self.connect_selection()
         self.clear_detail_panel()
-
-    def normalize_value(self, value):
-        text = str(value)
-        if text.startswith(">>> ") and text.endswith(" <<<"):
-            return text[4:-4], True
-        return text, False
 
     def compute_base_widths(self, columns, results):
         if not columns:
@@ -558,8 +512,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for i in range(sample_size):
             left_vals, right_vals, _ = results[i]
             for col_idx in range(len(columns)):
-                l_text, _ = self.normalize_value(left_vals[col_idx] if col_idx < len(left_vals) else "")
-                r_text, _ = self.normalize_value(right_vals[col_idx] if col_idx < len(right_vals) else "")
+                l_text = str(left_vals[col_idx] if col_idx < len(left_vals) else "")
+                r_text = str(right_vals[col_idx] if col_idx < len(right_vals) else "")
                 max_widths[col_idx] = max(max_widths[col_idx], metrics.horizontalAdvance(l_text))
                 max_widths[col_idx] = max(max_widths[col_idx], metrics.horizontalAdvance(r_text))
         self.base_col_widths = [min(w + 30, 600) for w in max_widths]
@@ -635,26 +589,28 @@ class MainWindow(QtWidgets.QMainWindow):
         search_kw = self.search_edit.text().strip().lower()
         filter_status = self.filter_combo.currentText()
         filtered = []
-        for left_vals, right_vals, tags in self.all_results:
+        for left_vals, right_vals, info in self.all_results:
             status = left_vals[0] if left_vals else ""
-            if filter_status != "全部" and status != filter_status:
-                continue
+            if filter_status != "全部状态" and status != filter_status.replace("只看", "").replace("项", ""):
+                # 处理 "全部状态" 和 "只看修改" 等文本匹配
+                current_filter = filter_status.replace("只看", "").replace("项", "")
+                if current_filter != "全部状态" and status != current_filter:
+                    continue
+            
             if search_kw:
                 found = False
                 for val in left_vals:
-                    text, _ = self.normalize_value(val)
-                    if search_kw in text.lower():
+                    if search_kw in str(val).lower():
                         found = True
                         break
                 if not found:
                     for val in right_vals:
-                        text, _ = self.normalize_value(val)
-                        if search_kw in text.lower():
+                        if search_kw in str(val).lower():
                             found = True
                             break
                 if not found:
                     continue
-            filtered.append((left_vals, right_vals, tags))
+            filtered.append((left_vals, right_vals, info))
         self.update_tables_data(self.last_columns, filtered, update_cache=False)
 
     def update_freeze(self):
@@ -678,31 +634,38 @@ class MainWindow(QtWidgets.QMainWindow):
     def update_detail_panel(self, row_idx):
         if not self.display_results or row_idx >= len(self.display_results):
             return
-        left_data, right_data, tags = self.display_results[row_idx]
+        left_data, right_data, info = self.display_results[row_idx]
         columns = self.last_columns or []
         status = left_data[0] if left_data else ""
+        diff_cols = info.get('diff_cols', [])
+        
         html_parts = []
         html_parts.append(f"<b>行索引:</b> {row_idx + 1} | <b>状态:</b> {status}<br>")
         html_parts.append("<hr>")
+        
         has_diff = False
         for i in range(1, len(columns)):
             col_name = columns[i]
             val1 = left_data[i] if i < len(left_data) else ""
             val2 = right_data[i] if i < len(right_data) else ""
-            v1_text, v1_diff = self.normalize_value(val1)
-            v2_text, v2_diff = self.normalize_value(val2)
-            is_diff = v1_diff or v2_diff or status in ["新增", "删除"]
-            if not is_diff:
+            
+            is_cell_diff = i in diff_cols
+            is_row_diff = status in ["新增", "删除"]
+            
+            if not (is_cell_diff or is_row_diff):
                 continue
+                
             has_diff = True
             html_parts.append(f"<b>列:</b> {col_name}<br>")
             if status == "删除":
-                html_parts.append(f"<span style='color:#CC0000'>旧值:</span> <span style='background:#FFCCCC'>{v1_text}</span><br><br>")
+                html_parts.append(f"<span style='color:#CC0000'>旧值:</span> <span style='background:#FFFFCC'>{val1}</span><br><br>")
             elif status == "新增":
-                html_parts.append(f"<span style='color:#CC0000'>新值:</span> <span style='background:#FFCCCC'>{v2_text}</span><br><br>")
+                html_parts.append(f"<span style='color:#CC0000'>新值:</span> <span style='background:#CCFFCC'>{val2}</span><br><br>")
             else:
-                html_parts.append(f"<span style='color:#CC0000'>旧值:</span> <span style='background:#FFCCCC'>{v1_text}</span><br>")
-                html_parts.append(f"<span style='color:#CC0000'>新值:</span> <span style='background:#FFCCCC'>{v2_text}</span><br><br>")
+                # 修改行，且该列有差异
+                html_parts.append(f"<span style='color:#CC0000'>旧值:</span> <span style='background:#FFCCCC'>{val1}</span><br>")
+                html_parts.append(f"<span style='color:#CC0000'>新值:</span> <span style='background:#FFCCCC'>{val2}</span><br><br>")
+                
         if not has_diff:
             html_parts.append("<span style='color:#666666'>该行内容完全一致，无差异明细。</span>")
         self.detail_text.setHtml("".join(html_parts))

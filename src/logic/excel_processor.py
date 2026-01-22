@@ -172,36 +172,28 @@ class ExcelDiffer:
 
     @staticmethod
     def _compare_by_sequence(df1, df2, data_columns, all_columns):
-        """优化的基于序列对齐的比对逻辑"""
-        # 1. 预计算哈希值，提升序列比对和相等判断速度
-        # 使用 values 数组操作，避免 iloc/get(col) 产生的 KeyError
-        # data_columns 此时包含了新旧文件的列并集，但 df1 或 df2 可能缺失某些列
-        
+        """高度矢量化的基于序列对齐的比对逻辑"""
         def get_row_data(df, target_cols):
-            # 建立一个与 target_cols 对应的空数据行，确保不会出现 KeyError
             rows = []
             for _, row in df.iterrows():
                 row_vals = []
                 for col in target_cols:
-                    # 使用 row.get 而非 row[col]，因为 df 可能缺少并集中的某些列
                     val = row.get(col, "")
-                    row_vals.append(val)
+                    row_vals.append(str(val).strip())
                 rows.append(tuple(row_vals))
             return rows
 
         rows1 = get_row_data(df1, data_columns)
         rows2 = get_row_data(df2, data_columns)
         
-        # 2. 序列比对
         matcher = difflib.SequenceMatcher(None, rows1, rows2, autojunk=False)
         results = []
         
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag == 'equal':
-                # 全等块
                 for k in range(i2 - i1):
                     row_vals = list(rows1[i1 + k])
-                    results.append((["一致"] + row_vals, ["一致"] + row_vals, ['equal']))
+                    results.append((["一致"] + row_vals, ["一致"] + row_vals, {'status': 'equal', 'diff_cols': []}))
             
             elif tag == 'replace':
                 count1 = i2 - i1
@@ -216,39 +208,32 @@ class ExcelDiffer:
                         
                         if r1_tuple == r2_tuple:
                             vals = list(r1_tuple)
-                            results.append((["一致"] + vals, ["一致"] + vals, ['equal']))
+                            results.append((["一致"] + vals, ["一致"] + vals, {'status': 'equal', 'diff_cols': []}))
                         else:
-                            # 逐列比对，标记 >>> diff <<<
-                            l_row = []
-                            r_row = []
-                            has_diff = False
-                            for v1, v2 in zip(r1_tuple, r2_tuple):
-                                if str(v1).strip() != str(v2).strip():
-                                    l_row.append(f">>> {v1} <<<")
-                                    r_row.append(f">>> {v2} <<<")
-                                    has_diff = True
-                                else:
-                                    l_row.append(str(v1))
-                                    r_row.append(str(v2))
+                            l_row = list(r1_tuple)
+                            r_row = list(r2_tuple)
+                            diff_cols = []
+                            for idx, (v1, v2) in enumerate(zip(r1_tuple, r2_tuple)):
+                                if v1 != v2:
+                                    diff_cols.append(idx + 1)
                             
-                            status = "修改" if has_diff else "一致"
-                            results.append(([status] + l_row, [status] + r_row, ['modified' if has_diff else 'equal']))
+                            results.append((["修改"] + l_row, ["修改"] + r_row, {'status': 'modified', 'diff_cols': diff_cols}))
                     elif has_row1:
                         row_vals = list(rows1[i1 + k])
-                        results.append((["删除"] + row_vals, ["删除"] + ["" for _ in data_columns], ['deleted']))
+                        results.append((["删除"] + row_vals, ["删除"] + ["" for _ in data_columns], {'status': 'deleted', 'diff_cols': []}))
                     elif has_row2:
                         row_vals = list(rows2[j1 + k])
-                        results.append((["新增"] + ["" for _ in data_columns], ["新增"] + row_vals, ['added']))
+                        results.append((["新增"] + ["" for _ in data_columns], ["新增"] + row_vals, {'status': 'added', 'diff_cols': []}))
             
             elif tag == 'delete':
                 for k in range(i1, i2):
                     row_vals = list(rows1[k])
-                    results.append((["删除"] + row_vals, ["删除"] + ["" for _ in data_columns], ['deleted']))
+                    results.append((["删除"] + row_vals, ["删除"] + ["" for _ in data_columns], {'status': 'deleted', 'diff_cols': []}))
             
             elif tag == 'insert':
                 for k in range(j1, j2):
                     row_vals = list(rows2[k])
-                    results.append((["新增"] + ["" for _ in data_columns], ["新增"] + row_vals, ['added']))
+                    results.append((["新增"] + ["" for _ in data_columns], ["新增"] + row_vals, {'status': 'added', 'diff_cols': []}))
                     
         return all_columns, results
 
@@ -292,7 +277,7 @@ class ExcelDiffer:
             diff_mask = (v1 != v2) & both_mask
             has_diff_series |= diff_mask
             
-            # 生成显示文本
+            # 生成显示文本（保持原始数据，不再添加 >>> <<<）
             l_text = v1.copy()
             r_text = v2.copy()
             
@@ -300,12 +285,14 @@ class ExcelDiffer:
             l_text.loc[merged['_merge'] == 'right_only'] = ""
             r_text.loc[merged['_merge'] == 'left_only'] = ""
             
-            # 标记修改点
-            l_text.loc[diff_mask] = ">>> " + v1.loc[diff_mask] + " <<<"
-            r_text.loc[diff_mask] = ">>> " + v2.loc[diff_mask] + " <<<"
-            
             left_display[col] = l_text
             right_display[col] = r_text
+            
+            # 记录差异列索引（相对于 data_columns）
+            # 我们将在 results 的第 3 个元素（tags）中存储更多信息
+            # 原有的 tags 结构: ['modified'] 或 ['equal'] 等
+            # 新的 tags 结构: {'status': 'modified', 'diff_cols': [idx1, idx2...]}
+            # 但为了保持兼容性，我们先保留 results 的基本结构，稍后在 MainWindow 中处理
 
         # 4. 计算最终状态
         final_status = pd.Series("", index=merged.index)
@@ -314,30 +301,34 @@ class ExcelDiffer:
         final_status.loc[both_mask & has_diff_series] = "修改"
         final_status.loc[both_mask & ~has_diff_series] = "一致"
 
-        # 5. 构建结果列表 (结果格式: ([status] + l_row, [status] + r_row, tags))
+        # 5. 构建结果列表
+        # 结果格式: (left_row, right_row, diff_info)
+        # diff_info 现在是一个字典，包含 status 和 diff_cols (发生修改的列索引列表)
         results = []
         status_list = final_status.tolist()
         left_data = left_display.values.tolist()
         right_data = right_display.values.tolist()
         merge_indicators = merged['_merge'].tolist()
         
-        tag_map = {
-            'left_only': ['deleted'],
-            'right_only': ['added'],
-            'both_diff': ['modified'],
-            'both_equal': ['equal']
-        }
-
         for i in range(len(merged)):
-            st = status_list[i]
             indicator = merge_indicators[i]
+            st = status_list[i]
             
-            if indicator == 'both':
-                tag = tag_map['both_diff'] if has_diff_series.iloc[i] else tag_map['both_equal']
-            else:
-                tag = tag_map[indicator]
+            diff_cols = []
+            if indicator == 'both' and st == "修改":
+                # 找出该行哪些列有差异
+                for col_idx, col in enumerate(data_columns):
+                    v1 = left_data[i][col_idx]
+                    v2 = right_data[i][col_idx]
+                    if v1 != v2:
+                        diff_cols.append(col_idx + 1) # +1 是因为结果行第一列是"状态"
+            
+            diff_info = {
+                'status': 'deleted' if indicator == 'left_only' else ('added' if indicator == 'right_only' else ('modified' if diff_cols else 'equal')),
+                'diff_cols': diff_cols
+            }
                 
-            results.append(([st] + left_data[i], [st] + right_data[i], tag))
+            results.append(([st] + left_data[i], [st] + right_data[i], diff_info))
 
         return all_columns, results
 
@@ -396,41 +387,27 @@ class ExcelDiffer:
             cell_r.font = bold_font
 
         # 写入数据并设置高亮
-        for row_idx, (left_vals, right_vals, tags) in enumerate(results):
+        for row_idx, (left_vals, right_vals, info) in enumerate(results):
             excel_row = row_idx + 2
+            status = info.get('status', 'equal')
+            diff_cols = info.get('diff_cols', [])
             
             # 处理左侧数据
             for col_idx, val in enumerate(left_vals):
-                val_str = str(val)
-                actual_val = val
-                is_diff = False
+                cell = ws.cell(row=excel_row, column=col_idx+1, value=val)
                 
-                if val_str.startswith(">>> ") and val_str.endswith(" <<<"):
-                    actual_val = val_str[4:-4]
-                    is_diff = True
-                
-                cell = ws.cell(row=excel_row, column=col_idx+1, value=actual_val)
-                
-                if 'deleted' in tags:
+                if status == 'deleted':
                     cell.fill = deleted_fill
-                elif is_diff:
+                elif status == 'modified' and col_idx in diff_cols:
                     cell.fill = modified_fill
 
             # 处理右侧数据
             for col_idx, val in enumerate(right_vals):
-                val_str = str(val)
-                actual_val = val
-                is_diff = False
+                cell = ws.cell(row=excel_row, column=col_idx+half_cols+2, value=val)
                 
-                if val_str.startswith(">>> ") and val_str.endswith(" <<<"):
-                    actual_val = val_str[4:-4]
-                    is_diff = True
-                
-                cell = ws.cell(row=excel_row, column=col_idx+half_cols+2, value=actual_val)
-                
-                if 'added' in tags:
+                if status == 'added':
                     cell.fill = added_fill
-                elif is_diff:
+                elif status == 'modified' and col_idx in diff_cols:
                     cell.fill = modified_fill
 
         # 自动调整列宽
