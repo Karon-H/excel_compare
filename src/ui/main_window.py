@@ -3,6 +3,7 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 from src.logic.excel_processor import ExcelDiffer
 from src.ui.frozen_table_view import FrozenTableView
 from src.ui.diff_table_model import DiffTableModel
+from src.ui.statistics_dialog import StatisticsDialog
 
 
 class CompareWorker(QtCore.QObject):
@@ -422,12 +423,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filter_combo.setCurrentIndex(0)
         self.update_tables_data(columns, results, update_cache=True)
         
-        # 统计真实差异行数
-        diff_count = len([r for r in results if r[0][0] != "一致"])
-        if diff_count > 0:
-            QtWidgets.QMessageBox.information(self, "完成", f"比对完成！共发现 {diff_count} 行差异。")
-        else:
-            QtWidgets.QMessageBox.information(self, "完成", "比对完成！未发现任何差异。")
+        # 统计比对结果
+        stats = {
+            'added': 0,
+            'deleted': 0,
+            'modified_rows': 0,
+            'modified_cells': 0,
+            'equal': 0
+        }
+        
+        for r in results:
+            info = r[2]
+            status = info.get('status', 'equal')
+            if status == 'added':
+                stats['added'] += 1
+            elif status == 'deleted':
+                stats['deleted'] += 1
+            elif status == 'modified':
+                stats['modified_rows'] += 1
+                stats['modified_cells'] += len(info.get('diff_cols', []))
+            elif status == 'equal':
+                stats['equal'] += 1
+        
+        # 弹出统计仪表盘
+        dialog = StatisticsDialog(stats, self)
+        dialog.exec_()
 
     def on_compare_error(self, message):
         if self.progress_dialog:
