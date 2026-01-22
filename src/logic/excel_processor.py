@@ -254,64 +254,91 @@ class ExcelDiffer:
 
     @staticmethod
     def _compare_by_keys(df1, df2, key_columns, data_columns, all_columns):
-        """优化的基于主键的比对逻辑"""
-        # 建立索引，提高查找速度
-        # 使用 set_index 之前，先确保主键列在 df 中存在 (已经在上层 compare_dataframes 校验过)
-        # 这里使用 copy 避免修改原始 DataFrame
+        """高度矢量化的基于主键的比对逻辑"""
+        # 1. 预处理：主键列转字符串并去空格
         d1 = df1.copy()
         d2 = df2.copy()
-        
-        # 将主键列转换为字符串，避免类型不匹配
         for col in key_columns:
             d1[col] = d1[col].astype(str).str.strip()
             d2[col] = d2[col].astype(str).str.strip()
-            
-        d1.set_index(key_columns, inplace=True, drop=False)
-        d2.set_index(key_columns, inplace=True, drop=False)
+
+        # 2. 使用 merge 进行对齐
+        merged = pd.merge(
+            d1, d2, 
+            on=key_columns, 
+            how='outer', 
+            suffixes=('_old', '_new'), 
+            indicator=True
+        )
+
+        # 3. 矢量化计算每列的显示文本和差异标记
+        # 初始化左右两列的显示 DataFrame
+        left_display = pd.DataFrame(index=merged.index)
+        right_display = pd.DataFrame(index=merged.index)
         
-        # 获取所有主键的并集
-        all_keys = list(d1.index.union(d2.index))
+        # 记录哪些行有差异（仅针对 'both' 类型）
+        both_mask = merged['_merge'] == 'both'
+        has_diff_series = pd.Series(False, index=merged.index)
+
+        for col in data_columns:
+            col_old = col + '_old' if (col + '_old') in merged.columns else col
+            col_new = col + '_new' if (col + '_new') in merged.columns else col
+            
+            # 统一转为字符串并去空格进行比对
+            v1 = merged[col_old].astype(str).str.strip() if col_old in merged.columns else pd.Series("", index=merged.index)
+            v2 = merged[col_new].astype(str).str.strip() if col_new in merged.columns else pd.Series("", index=merged.index)
+            
+            # 只有在 both 且值不同时才标记差异
+            diff_mask = (v1 != v2) & both_mask
+            has_diff_series |= diff_mask
+            
+            # 生成显示文本
+            l_text = v1.copy()
+            r_text = v2.copy()
+            
+            # 对于 left_only，右侧置空；对于 right_only，左侧置空
+            l_text.loc[merged['_merge'] == 'right_only'] = ""
+            r_text.loc[merged['_merge'] == 'left_only'] = ""
+            
+            # 标记修改点
+            l_text.loc[diff_mask] = ">>> " + v1.loc[diff_mask] + " <<<"
+            r_text.loc[diff_mask] = ">>> " + v2.loc[diff_mask] + " <<<"
+            
+            left_display[col] = l_text
+            right_display[col] = r_text
+
+        # 4. 计算最终状态
+        final_status = pd.Series("", index=merged.index)
+        final_status.loc[merged['_merge'] == 'left_only'] = "删除"
+        final_status.loc[merged['_merge'] == 'right_only'] = "新增"
+        final_status.loc[both_mask & has_diff_series] = "修改"
+        final_status.loc[both_mask & ~has_diff_series] = "一致"
+
+        # 5. 构建结果列表 (结果格式: ([status] + l_row, [status] + r_row, tags))
         results = []
+        status_list = final_status.tolist()
+        left_data = left_display.values.tolist()
+        right_data = right_display.values.tolist()
+        merge_indicators = merged['_merge'].tolist()
         
-        for key in all_keys:
-            in_d1 = key in d1.index
-            in_d2 = key in d2.index
+        tag_map = {
+            'left_only': ['deleted'],
+            'right_only': ['added'],
+            'both_diff': ['modified'],
+            'both_equal': ['equal']
+        }
+
+        for i in range(len(merged)):
+            st = status_list[i]
+            indicator = merge_indicators[i]
             
-            if in_d1 and in_d2:
-                # 注意：处理重复主键，取第一个
-                r1 = d1.loc[[key]].iloc[0]
-                r2 = d2.loc[[key]].iloc[0]
+            if indicator == 'both':
+                tag = tag_map['both_diff'] if has_diff_series.iloc[i] else tag_map['both_equal']
+            else:
+                tag = tag_map[indicator]
                 
-                # 逐列比对
-                l_row = []
-                r_row = []
-                has_diff = False
-                
-                for col in data_columns:
-                    v1 = r1.get(col, "")
-                    v2 = r2.get(col, "")
-                    
-                    if str(v1).strip() != str(v2).strip():
-                        l_row.append(f">>> {v1} <<<")
-                        r_row.append(f">>> {v2} <<<")
-                        has_diff = True
-                    else:
-                        l_row.append(str(v1))
-                        r_row.append(str(v2))
-                
-                status = "修改" if has_diff else "一致"
-                results.append(([status] + l_row, [status] + r_row, ['modified' if has_diff else 'equal']))
-                
-            elif in_d1:
-                r1 = d1.loc[[key]].iloc[0]
-                vals = [str(r1.get(col, "")).strip() for col in data_columns]
-                results.append((["删除"] + vals, ["删除"] + ["" for _ in data_columns], ['deleted']))
-                
-            elif in_d2:
-                r2 = d2.loc[[key]].iloc[0]
-                vals = [str(r2.get(col, "")).strip() for col in data_columns]
-                results.append((["新增"] + ["" for _ in data_columns], ["新增"] + vals, ['added']))
-                
+            results.append(([st] + left_data[i], [st] + right_data[i], tag))
+
         return all_columns, results
 
     @staticmethod
