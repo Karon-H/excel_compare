@@ -21,14 +21,14 @@ class ExcelDiffer:
             else:
                 engine = None
             
-            # 使用指定引擎读取，确保与后续读取逻辑一致
-            xl = pd.ExcelFile(filepath, engine=engine)
-            return xl.sheet_names
+            # 使用 context manager 确保文件关闭
+            with pd.ExcelFile(filepath, engine=engine) as xl:
+                return xl.sheet_names
         except Exception as e:
             # 降级处理：尝试不指定引擎
             try:
-                xl = pd.ExcelFile(filepath)
-                return xl.sheet_names
+                with pd.ExcelFile(filepath) as xl:
+                    return xl.sheet_names
             except:
                 raise Exception(f"无法获取 Excel Sheet 列表: {e}")
 
@@ -52,8 +52,8 @@ class ExcelDiffer:
         # --- 预处理 Sheet 名称 ---
         # 获取所有实际的 Sheet 名称
         try:
-            xl = pd.ExcelFile(filepath, engine=engine)
-            actual_sheets = xl.sheet_names
+            with pd.ExcelFile(filepath, engine=engine) as xl:
+                actual_sheets = xl.sheet_names
             
             # 1. 尝试完全匹配
             target_sheet = sheet_name
@@ -145,9 +145,9 @@ class ExcelDiffer:
         - 如果 key_columns 不为空，使用主键比对算法。
         返回格式: (all_columns, results)
         """
-        # 填充缺失值为特定字符串
-        df1 = df1.fillna("")
-        df2 = df2.fillna("")
+        # 填充缺失值为特定字符串，避免 FutureWarning
+        df1 = df1.fillna("").infer_objects(copy=False)
+        df2 = df2.fillna("").infer_objects(copy=False)
         
         # 校验主键列是否存在
         if key_columns:
