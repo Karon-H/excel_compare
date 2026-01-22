@@ -177,18 +177,29 @@ class MainWindow(QtWidgets.QMainWindow):
         view_layout = QtWidgets.QHBoxLayout()
         self.sync_v_cb = QtWidgets.QCheckBox("纵滚同步")
         self.sync_h_cb = QtWidgets.QCheckBox("横滚同步")
-        self.freeze_cb = QtWidgets.QCheckBox("冻结首列")
+        
+        # 冻结设置
+        self.freeze_row_spin = QtWidgets.QSpinBox()
+        self.freeze_col_spin = QtWidgets.QSpinBox()
+        self.freeze_row_spin.setRange(0, 20)
+        self.freeze_col_spin.setRange(0, 20)
+        self.freeze_row_spin.setFixedWidth(45)
+        self.freeze_col_spin.setFixedWidth(45)
+        self.freeze_row_spin.valueChanged.connect(self.update_freeze)
+        self.freeze_col_spin.valueChanged.connect(self.update_freeze)
+        
         self.sync_v_cb.setChecked(True)
         self.sync_h_cb.setChecked(True)
-        self.freeze_cb.setChecked(False)
         self.detail_toggle = QtWidgets.QCheckBox("差异明细")
         
         self.detail_toggle.toggled.connect(self.toggle_detail_panel)
-        self.freeze_cb.toggled.connect(self.toggle_freeze)
         
         view_layout.addWidget(self.sync_v_cb)
         view_layout.addWidget(self.sync_h_cb)
-        view_layout.addWidget(self.freeze_cb)
+        view_layout.addWidget(QtWidgets.QLabel("冻结行:"))
+        view_layout.addWidget(self.freeze_row_spin)
+        view_layout.addWidget(QtWidgets.QLabel("冻结列:"))
+        view_layout.addWidget(self.freeze_col_spin)
         view_layout.addWidget(self.detail_toggle)
         options_layout.addLayout(view_layout)
         
@@ -216,8 +227,8 @@ class MainWindow(QtWidgets.QMainWindow):
         compare_tab_layout.setContentsMargins(0, 0, 0, 0)
         
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        self.left_table = QtWidgets.QTableView()
-        self.right_table = QtWidgets.QTableView()
+        self.left_table = FrozenTableView()
+        self.right_table = FrozenTableView()
         for t in [self.left_table, self.right_table]:
             t.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
             t.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
@@ -242,7 +253,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Tab 2: 差异项列表 (只显示有差异的行)
         self.diff_tab = QtWidgets.QWidget()
         diff_tab_layout = QtWidgets.QVBoxLayout(self.diff_tab)
-        self.diff_table = QtWidgets.QTableView()
+        self.diff_table = FrozenTableView()
         self.diff_table.setAlternatingRowColors(True)
         diff_tab_layout.addWidget(self.diff_table)
         self.tab_widget.addTab(self.diff_tab, "差异项总览")
@@ -557,6 +568,8 @@ class MainWindow(QtWidgets.QMainWindow):
         row_height = int(value)
         for t in [self.left_table, self.right_table, self.diff_table]:
             t.verticalHeader().setDefaultSectionSize(row_height)
+            if hasattr(t, 'update_frozen_geometry'):
+                t.update_frozen_geometry()
 
     def apply_column_widths(self, value):
         if not self.base_col_widths:
@@ -566,8 +579,9 @@ class MainWindow(QtWidgets.QMainWindow):
             width = int(base_w * factor)
             self.left_table.setColumnWidth(i, width)
             self.right_table.setColumnWidth(i, width)
-        # 差异汇总表不使用基础宽度，因为它列结构不同
-        # self.diff_table.update_frozen_geometry()
+        
+        self.left_table.update_frozen_geometry()
+        self.right_table.update_frozen_geometry()
 
     def connect_selection(self):
         if self.left_table.selectionModel():
@@ -643,10 +657,13 @@ class MainWindow(QtWidgets.QMainWindow):
             filtered.append((left_vals, right_vals, tags))
         self.update_tables_data(self.last_columns, filtered, update_cache=False)
 
-    def toggle_freeze(self, checked):
-        pass
-        # for t in [self.left_table, self.right_table, self.diff_table]:
-        #     t.set_frozen(checked)
+    def update_freeze(self):
+        if not hasattr(self, 'left_table') or not hasattr(self, 'right_table') or not hasattr(self, 'diff_table'):
+            return
+        rows = self.freeze_row_spin.value()
+        cols = self.freeze_col_spin.value()
+        for t in [self.left_table, self.right_table, self.diff_table]:
+            t.set_frozen(rows, cols)
 
     def toggle_detail_panel(self, checked):
         if checked:
