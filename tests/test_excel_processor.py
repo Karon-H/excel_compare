@@ -16,6 +16,14 @@ class TestExcelDiffer(unittest.TestCase):
         cls.file2 = os.path.join(cls.test_dir, "test2.xlsx")
         cls.file_empty = os.path.join(cls.test_dir, "empty.xlsx")
         
+        # 创建有偏移表头的测试数据
+        df_offset = pd.DataFrame({
+            "A": ["ignore", "ignore", "RealCol1", "Data1"],
+            "B": ["ignore", "ignore", "RealCol2", "Data2"]
+        })
+        cls.file_offset = os.path.join(cls.test_dir, "offset.xlsx")
+        df_offset.to_excel(cls.file_offset, index=False, header=False)
+        
         # 创建标准测试数据
         df1 = pd.DataFrame({
             "ID": [1, 2, 3],
@@ -96,6 +104,23 @@ class TestExcelDiffer(unittest.TestCase):
         self.assertEqual(status_map.get('2'), 'modified')
         self.assertEqual(status_map.get('3'), 'deleted')
         self.assertEqual(str(added_id), '4')
+
+    def test_read_excel_with_custom_header(self):
+        """测试指定表头行号读取"""
+        # 指定第 3 行为表头
+        df = ExcelDiffer.read_excel_raw(self.file_offset, "Sheet1", header_row=3)
+        self.assertEqual(list(df.columns), ["RealCol1", "RealCol2"])
+        self.assertEqual(len(df), 1)
+        self.assertEqual(df.iloc[0]["RealCol1"], "Data1")
+
+    def test_read_excel_no_header(self):
+        """测试无表头模式读取"""
+        df = ExcelDiffer.read_excel_raw(self.file1, "Sheet1", has_header=False)
+        # file1 有 3 行数据 + 1 行原始表头 = 4 行
+        self.assertEqual(len(df), 4)
+        self.assertEqual(df.columns[0], "列1")
+        # 第一行应该是原始文件的表头行内容
+        self.assertEqual(df.iloc[0]["列1"], "ID")
 
     def test_missing_key_columns(self):
         """测试缺少主键列时的异常处理"""

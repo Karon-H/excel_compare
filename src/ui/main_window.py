@@ -11,21 +11,23 @@ class CompareWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(list, list)
     error = QtCore.pyqtSignal(str)
 
-    def __init__(self, file1, file2, sheet1, sheet2, key_cols):
+    def __init__(self, file1, file2, sheet1, sheet2, key_cols, header_row=None, has_header=True):
         super().__init__()
         self.file1 = file1
         self.file2 = file2
         self.sheet1 = sheet1
         self.sheet2 = sheet2
         self.key_cols = key_cols
+        self.header_row = header_row
+        self.has_header = has_header
 
     @QtCore.pyqtSlot()
     def run(self):
         try:
             self.progress.emit(10, "正在读取文件 1...")
-            df1 = ExcelDiffer.read_excel_raw(self.file1, self.sheet1, handle_merged=True)
+            df1 = ExcelDiffer.read_excel_raw(self.file1, self.sheet1, handle_merged=True, header_row=self.header_row, has_header=self.has_header)
             self.progress.emit(30, "正在读取文件 2...")
-            df2 = ExcelDiffer.read_excel_raw(self.file2, self.sheet2, handle_merged=True)
+            df2 = ExcelDiffer.read_excel_raw(self.file2, self.sheet2, handle_merged=True, header_row=self.header_row, has_header=self.has_header)
             mode_text = "主键" if self.key_cols else "序列"
             self.progress.emit(50, f"正在进行{mode_text}比对...")
             columns, results = ExcelDiffer.compare_dataframes(df1, df2, key_columns=self.key_cols)
@@ -156,9 +158,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.key_btn.setEnabled(False)
         self.key_mode_cb.toggled.connect(self.toggle_key_mode)
         self.key_btn.clicked.connect(self.select_key_columns)
+        
+        # 表头行设置
+        header_row_layout = QtWidgets.QHBoxLayout()
+        self.no_header_cb = QtWidgets.QCheckBox("无表头")
+        self.header_row_spin = QtWidgets.QSpinBox()
+        self.header_row_spin.setRange(1, 100)
+        self.header_row_spin.setValue(1)
+        self.header_row_spin.setFixedWidth(50)
+        self.no_header_cb.toggled.connect(lambda checked: self.header_row_spin.setEnabled(not checked))
+        header_row_layout.addWidget(self.no_header_cb)
+        header_row_layout.addWidget(QtWidgets.QLabel("表头行:"))
+        header_row_layout.addWidget(self.header_row_spin)
+        
         key_layout.addWidget(self.key_mode_cb)
         key_layout.addWidget(self.key_btn)
         key_layout.addWidget(self.key_label)
+        key_layout.addStretch()
+        key_layout.addLayout(header_row_layout)
         options_layout.addLayout(key_layout)
 
         # 搜索过滤
@@ -335,7 +352,9 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "提示", "请先选择文件和 Sheet 以获取列信息")
             return
         try:
-            df = ExcelDiffer.read_excel_raw(file1, sheet1, handle_merged=False)
+            header_row = self.header_row_spin.value()
+            has_header = not self.no_header_cb.isChecked()
+            df = ExcelDiffer.read_excel_raw(file1, sheet1, handle_merged=False, header_row=header_row, has_header=has_header)
             columns = list(df.columns)
             dialog = KeyColumnsDialog(columns, self.key_columns, self)
             if dialog.exec_() == QtWidgets.QDialog.Accepted:
@@ -397,8 +416,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress_dialog.setAutoReset(False)
         self.progress_dialog.show()
 
+        header_row = self.header_row_spin.value()
+        has_header = not self.no_header_cb.isChecked()
         self.worker_thread = QtCore.QThread()
-        self.worker = CompareWorker(file1, file2, sheet1, sheet2, key_cols)
+        self.worker = CompareWorker(file1, file2, sheet1, sheet2, key_cols, header_row=header_row, has_header=has_header)
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.update_progress)
@@ -478,44 +499,84 @@ class MainWindow(QtWidgets.QMainWindow):
         self.left_model = left_model
         self.right_model = right_model
 
-        # 3. 准备差异汇总表 (Tab 2)
+        # 3. 准备差异汇总表 (Tab 2) - 换成更直观的“变更列表”模式
         diff_only_results = [r for r in results if r[2]['status'] != "equal"]
         
-        # 差异汇总表列：[状态, 列1(旧), 列1(新), 列2(旧), 列2(新)...]
-        diff_summary_columns = ["状态"]
-        for col in columns[1:]:
-            diff_summary_columns.extend([f"{col}(旧)", f"{col}(新)"])
+        # 差异汇总表列：[主键/位置, 状态, 修改项, 旧值, 新值]
+        diff_summary_columns = ["主键/位置", "状态", "修改项", "旧值 (旧文件)", "新值 (新文件)"]
         
-        # 构建差异汇总表的数据和特殊的 diff_infos
+        # 获取主键列的索引
+        key_indices = []
+        if self.key_columns:
+            for kc in self.key_columns:
+                if kc in columns:
+                    key_indices.append(columns.index(kc))
+        
         diff_summary_data = []
         diff_summary_infos = []
         
         for left_vals, right_vals, info in diff_only_results:
-            row_data = [info['status']]
-            # 对于汇总表，我们需要映射 diff_cols
-            new_diff_cols = []
+            status = info['status']
+            status_text = "修改" if status == 'modified' else ("新增" if status == 'added' else "删除")
             
-            for c_idx in range(1, col_count):
-                l_val = left_vals[c_idx]
-                r_val = right_vals[c_idx]
-                row_data.extend([l_val, r_val])
-                
-                # 如果该原始列有差异，标记汇总表中的这两个子列
-                if c_idx in info.get('diff_cols', []):
-                    new_diff_cols.append((c_idx-1)*2 + 1)
-                    new_diff_cols.append((c_idx-1)*2 + 2)
-            
-            diff_summary_data.append(row_data)
-            diff_summary_infos.append({
-                'status': info['status'],
-                'diff_cols': new_diff_cols
-            })
+            # 确定行标识信息 (Key Info)
+            if key_indices:
+                # 优先从新值中获取主键（处理新增），新值没有则从旧值获取（处理删除）
+                # 注意：excel_processor 保证了主键一致时 left_vals/right_vals 的主键位相同
+                base_vals = right_vals if status != 'deleted' else left_vals
+                key_vals = [str(base_vals[i]) for i in key_indices if i < len(base_vals)]
+                key_info = " | ".join(key_vals)
+            else:
+                # 无主键模式，使用数据在结果集中的序号（大致对应行号）
+                try:
+                    orig_idx = results.index((left_vals, right_vals, info))
+                    key_info = f"第 {orig_idx + 1} 行"
+                except:
+                    key_info = "未知行"
+
+            if status == 'modified':
+                diff_cols = info.get('diff_cols', [])
+                for c_idx in diff_cols:
+                    col_name = columns[c_idx]
+                    l_val = left_vals[c_idx]
+                    r_val = right_vals[c_idx]
+                    diff_summary_data.append([key_info, status_text, col_name, l_val, r_val])
+                    # 高亮“旧值”和“新值”列 (索引 3 和 4)
+                    diff_summary_infos.append({
+                        'status': 'modified', 
+                        'diff_cols': [3, 4]
+                    })
+            elif status == 'added':
+                # 新增行：展示一个概览，提示去主视图查看完整行
+                diff_summary_data.append([key_info, status_text, "整行", "", "(查看主视图详情)"])
+                diff_summary_infos.append({'status': 'added', 'diff_cols': []})
+            elif status == 'deleted':
+                # 删除行
+                diff_summary_data.append([key_info, status_text, "整行", "(查看主视图详情)", ""])
+                diff_summary_infos.append({'status': 'deleted', 'diff_cols': []})
 
         diff_model = DiffTableModel(diff_summary_data, diff_summary_columns, diff_summary_infos, role_type="diff", parent=self)
         self.diff_table.setModel(diff_model)
         
         # 4. 界面调整
-        self.diff_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        header = self.diff_table.horizontalHeader()
+        header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)  # 允许手动调整
+        self.diff_table.resizeColumnsToContents()
+        
+        # 限制某些列的最大宽度，防止被撑开得太大导致“显示不全”
+        max_col_width = 350
+        for i in range(header.count()):
+            if self.diff_table.columnWidth(i) > max_col_width:
+                self.diff_table.setColumnWidth(i, max_col_width)
+        
+        # 针对“旧值”和“新值”列给予足够的最小宽度，并让最后一列自动填充
+        if header.count() >= 5:
+            # 索引 3 和 4 分别是旧值和新值
+            self.diff_table.setColumnWidth(3, max(self.diff_table.columnWidth(3), 150))
+            self.diff_table.setColumnWidth(4, max(self.diff_table.columnWidth(4), 150))
+        
+        header.setStretchLastSection(True)
+        
         self.apply_row_height(self.row_height_spin.value())
         self.compute_base_widths(columns, results)
         self.apply_column_widths(self.col_width_spin.value())
@@ -698,7 +759,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not output_path:
             return
         try:
-            ExcelDiffer.export_diff(output_path, self.last_columns, self.all_results)
+            ExcelDiffer.export_diff(output_path, self.last_columns, self.all_results, self.key_columns)
             QtWidgets.QMessageBox.information(self, "成功", f"结果已成功导出至:\n{output_path}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "错误", f"导出失败: {e}")

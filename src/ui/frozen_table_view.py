@@ -42,6 +42,27 @@ class FrozenTableView(QtWidgets.QTableView):
             view.setAlternatingRowColors(True)
             view.hide()
             self.viewport().stackUnder(view)
+            # 安装事件过滤器，以便统一处理鼠标滚轮等事件
+            view.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QtCore.QEvent.Wheel:
+            if obj in [self.left_view, self.top_view, self.corner_view]:
+                # 将子视图的滚轮事件转发给主视图处理
+                self.wheelEvent(event)
+                return True
+        return super().eventFilter(obj, event)
+
+    def wheelEvent(self, event):
+        if event.modifiers() & QtCore.Qt.ShiftModifier:
+            # Shift + 滚轮 -> 横向滚动
+            delta = event.angleDelta().y()
+            h_bar = self.horizontalScrollBar()
+            # 滚动步长，可以根据需要调整，这里直接使用 delta
+            h_bar.setValue(h_bar.value() - delta)
+            event.accept()
+        else:
+            super().wheelEvent(event)
 
     def set_frozen(self, rows: int, cols: int):
         """设置冻结的行数和列数"""

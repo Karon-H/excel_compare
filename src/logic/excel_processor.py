@@ -33,12 +33,14 @@ class ExcelDiffer:
                 raise Exception(f"无法获取 Excel Sheet 列表: {e}")
 
     @staticmethod
-    def read_excel_raw(filepath, sheet_name, handle_merged=True):
+    def read_excel_raw(filepath, sheet_name=None, handle_merged=True, header_row=None, has_header=True):
         """
         极致健壮的 Excel 读取逻辑：
         1. 自动识别引擎，支持多种 Excel 格式
         2. 智能匹配 Sheet 名称（防止空格、大小写导致的失败）
         3. 智能表头识别与合并单元格处理
+        - header_row: 指定表头所在行号（从 1 开始）。如果为 None，则自动寻找第一个非空行。
+        - has_header: 是否有表头。如果为 False，则自动生成列名。
         """
         # 自动识别引擎
         ext = os.path.splitext(filepath)[1].lower()
@@ -105,20 +107,44 @@ class ExcelDiffer:
             except Exception as merge_err:
                 print(f"合并单元格处理提示: {merge_err}")
         
-        # --- 移除全空行/列 ---
-        df = df.dropna(how='all').dropna(axis=1, how='all')
+        # --- 移除全空列 (行先保留，用于准确定位表头行) ---
+        df = df.dropna(axis=1, how='all')
         
         if not df.empty:
-            # --- 智能表头识别 ---
-            header_row_idx = 0
-            for i in range(len(df)):
-                # 寻找第一个包含非空值的行
-                if not df.iloc[i].isna().all():
-                    header_row_idx = i
-                    break
-            
-            header_values = df.iloc[header_row_idx]
-            df_data = df.iloc[header_row_idx + 1:]
+            # --- 表头识别 ---
+            if not has_header:
+                # 无表头模式：所有非空行都是数据
+                df_data = df.dropna(how='all')
+                header_values = [f"列{i+1}" for i in range(len(df.columns))]
+            elif header_row is not None:
+                # 用户指定了行号（1-based），对应原始索引 header_row-1
+                target_idx = int(header_row) - 1
+                if target_idx in df.index:
+                    header_row_idx = target_idx
+                else:
+                    # 如果指定行是空行被删了，或者越界，则尝试找第一个非空行
+                    header_row_idx = df.index[0] if not df.empty else 0
+                
+                try:
+                    header_values = df.loc[header_row_idx]
+                    df_data = df.loc[header_row_idx + 1:].dropna(how='all')
+                except:
+                    # 兜底逻辑
+                    header_values = df.iloc[0]
+                    df_data = df.iloc[1:].dropna(how='all')
+            else:
+                # 自动寻找第一个包含非空值的行
+                # 注意此时 df 还没 dropna(how='all')，所以我们需要找第一个非空行
+                non_empty_df = df.dropna(how='all')
+                header_row_idx = non_empty_df.index[0] if not non_empty_df.empty else 0
+                
+                try:
+                    header_values = df.loc[header_row_idx]
+                    df_data = df.loc[header_row_idx + 1:].dropna(how='all')
+                except:
+                    # 兜底逻辑
+                    header_values = df.iloc[0]
+                    df_data = df.iloc[1:].dropna(how='all')
             
             # 处理列名
             new_columns = []
@@ -360,67 +386,121 @@ class ExcelDiffer:
 
 
     @staticmethod
-    def export_diff(output_path, columns, results):
-        """将比对结果导出到 Excel，并应用单元格级别的高亮"""
+    def export_diff(output_path, columns, results, key_columns=None):
+        """将比对结果导出到 Excel，包含双窗视图和差异清单"""
         wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "比对结果"
-
+        
+        # --- Sheet 1: 双窗对比视图 ---
+        ws1 = wb.active
+        ws1.title = "对比视图"
+        
         # 定义样式
         header_fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
         modified_fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
         added_fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
         deleted_fill = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")
         bold_font = Font(bold=True)
-        center_align = Alignment(horizontal='center', vertical='center')
-
+        
         # 写入表头 (左右两部分)
         half_cols = len(columns)
         for i, col in enumerate(columns):
             # 左侧表头
-            cell_l = ws.cell(row=1, column=i+1, value=f"文件1_{col}")
+            cell_l = ws1.cell(row=1, column=i+1, value=f"旧_{col}")
             cell_l.fill = header_fill
             cell_l.font = bold_font
             # 右侧表头
-            cell_r = ws.cell(row=1, column=i+half_cols+2, value=f"文件2_{col}")
+            cell_r = ws1.cell(row=1, column=i+half_cols+2, value=f"新_{col}")
             cell_r.fill = header_fill
             cell_r.font = bold_font
 
-        # 写入数据并设置高亮
+        # 写入数据
         for row_idx, (left_vals, right_vals, info) in enumerate(results):
             excel_row = row_idx + 2
             status = info.get('status', 'equal')
             diff_cols = info.get('diff_cols', [])
             
-            # 处理左侧数据
+            # 左侧
             for col_idx, val in enumerate(left_vals):
-                cell = ws.cell(row=excel_row, column=col_idx+1, value=val)
-                
+                cell = ws1.cell(row=excel_row, column=col_idx+1, value=str(val))
                 if status == 'deleted':
                     cell.fill = deleted_fill
                 elif status == 'modified' and col_idx in diff_cols:
                     cell.fill = modified_fill
-
-            # 处理右侧数据
+            
+            # 右侧
             for col_idx, val in enumerate(right_vals):
-                cell = ws.cell(row=excel_row, column=col_idx+half_cols+2, value=val)
-                
+                cell = ws1.cell(row=excel_row, column=col_idx+half_cols+2, value=str(val))
                 if status == 'added':
                     cell.fill = added_fill
                 elif status == 'modified' and col_idx in diff_cols:
                     cell.fill = modified_fill
 
-        # 自动调整列宽
-        for col in ws.columns:
-            max_length = 0
-            column = col[0].column_letter
-            for cell in col:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = (max_length + 2)
-            ws.column_dimensions[column].width = min(adjusted_width, 50)
+        # --- Sheet 2: 差异清单 (Change List) ---
+        ws2 = wb.create_sheet("差异清单")
+        cl_headers = ["主键/位置", "状态", "修改项", "旧值 (旧文件)", "新值 (新文件)"]
+        for i, h in enumerate(cl_headers):
+            cell = ws2.cell(row=1, column=i+1, value=h)
+            cell.fill = header_fill
+            cell.font = bold_font
+        
+        # 获取主键索引
+        key_indices = []
+        if key_columns:
+            for kc in key_columns:
+                if kc in columns:
+                    key_indices.append(columns.index(kc))
+        
+        cl_row = 2
+        for i, (left_vals, right_vals, info) in enumerate(results):
+            status = info.get('status', 'equal')
+            if status == 'equal':
+                continue
+                
+            status_text = "修改" if status == 'modified' else ("新增" if status == 'added' else "删除")
+            
+            # 行标识
+            if key_indices:
+                base_vals = right_vals if status != 'deleted' else left_vals
+                key_info = " | ".join([str(base_vals[idx]) for idx in key_indices if idx < len(base_vals)])
+            else:
+                key_info = f"第 {i+1} 行"
+            
+            if status == 'modified':
+                for c_idx in info.get('diff_cols', []):
+                    ws2.cell(row=cl_row, column=1, value=key_info)
+                    ws2.cell(row=cl_row, column=2, value=status_text)
+                    ws2.cell(row=cl_row, column=3, value=columns[c_idx])
+                    ws2.cell(row=cl_row, column=4, value=str(left_vals[c_idx]))
+                    ws2.cell(row=cl_row, column=5, value=str(right_vals[c_idx]))
+                    # 修改项的高亮
+                    ws2.cell(row=cl_row, column=4).fill = modified_fill
+                    ws2.cell(row=cl_row, column=5).fill = modified_fill
+                    cl_row += 1
+            elif status == 'added':
+                ws2.cell(row=cl_row, column=1, value=key_info)
+                ws2.cell(row=cl_row, column=2, value=status_text)
+                ws2.cell(row=cl_row, column=3, value="整行")
+                ws2.cell(row=cl_row, column=5, value="(新增行)")
+                ws2.cell(row=cl_row, column=2).fill = added_fill
+                cl_row += 1
+            elif status == 'deleted':
+                ws2.cell(row=cl_row, column=1, value=key_info)
+                ws2.cell(row=cl_row, column=2, value=status_text)
+                ws2.cell(row=cl_row, column=3, value="整行")
+                ws2.cell(row=cl_row, column=4, value="(删除行)")
+                ws2.cell(row=cl_row, column=2).fill = deleted_fill
+                cl_row += 1
+
+        # 调整所有 Sheet 的列宽
+        for sheet in wb.worksheets:
+            for col in sheet.columns:
+                max_length = 0
+                column = col[0].column_letter
+                for cell in col:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except: pass
+                sheet.column_dimensions[column].width = min(max_length + 2, 60)
 
         wb.save(output_path)
