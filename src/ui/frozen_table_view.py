@@ -100,12 +100,16 @@ class FrozenTableView(QtWidgets.QTableView):
         # 同步行高
         self.left_view.setRowHeight(logicalIndex, newSize)
         self.corner_view.setRowHeight(logicalIndex, newSize)
+        if logicalIndex < self._frozen_rows:
+            self.top_view.setRowHeight(logicalIndex, newSize)
         self.update_frozen_geometry()
 
     def _on_h_section_resized(self, logicalIndex, oldSize, newSize):
         # 同步列宽
         self.top_view.setColumnWidth(logicalIndex, newSize)
         self.corner_view.setColumnWidth(logicalIndex, newSize)
+        if logicalIndex < self._frozen_cols:
+            self.left_view.setColumnWidth(logicalIndex, newSize)
         self.update_frozen_geometry()
 
     def _update_all_frozen_views(self):

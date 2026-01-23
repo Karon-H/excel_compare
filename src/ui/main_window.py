@@ -1,11 +1,23 @@
 import os
 from PyQt5 import QtWidgets, QtCore, QtGui
 from src.logic.excel_processor import ExcelDiffer
+from src.logic.csv_processor import CSVDiffer
 from src.ui.statistics_dialog import StatisticsDialog
 from src.ui.full_compare_dialog import FullCompareSummaryDialog
 from src.ui.frozen_table_view import FrozenTableView
 from src.ui.diff_table_model import DiffTableModel
 
+
+class DifferFactory:
+    """比对引擎工厂类"""
+    @staticmethod
+    def get_differ(filepath):
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext in ['.csv']:
+            return CSVDiffer()
+        else:
+            # 默认为 Excel 比对引擎
+            return ExcelDiffer()
 
 class CompareWorker(QtCore.QObject):
     progress = QtCore.pyqtSignal(int, str)
@@ -25,13 +37,14 @@ class CompareWorker(QtCore.QObject):
     @QtCore.pyqtSlot()
     def run(self):
         try:
+            differ = DifferFactory.get_differ(self.file1)
             self.progress.emit(10, "正在读取文件 1...")
-            df1 = ExcelDiffer.read_excel_raw(self.file1, self.sheet1, handle_merged=True, header_row=self.header_row, has_header=self.has_header)
+            df1 = differ.read_data(self.file1, self.sheet1, handle_merged=True, header_row=self.header_row, has_header=self.has_header)
             self.progress.emit(30, "正在读取文件 2...")
-            df2 = ExcelDiffer.read_excel_raw(self.file2, self.sheet2, handle_merged=True, header_row=self.header_row, has_header=self.has_header)
+            df2 = differ.read_data(self.file2, self.sheet2, handle_merged=True, header_row=self.header_row, has_header=self.has_header)
             mode_text = "主键" if self.key_cols else "序列"
             self.progress.emit(50, f"正在进行{mode_text}比对...")
-            columns, results = ExcelDiffer.compare_dataframes(df1, df2, key_columns=self.key_cols)
+            columns, results = differ.compare(df1, df2, key_columns=self.key_cols)
             total_rows = len(results)
             self.progress.emit(80, f"比对完成，正在准备渲染 {total_rows} 行数据...")
             self.finished.emit(columns, results)
@@ -55,7 +68,8 @@ class FullCompareWorker(QtCore.QObject):
     @QtCore.pyqtSlot()
     def run(self):
         try:
-            summary = ExcelDiffer.compare_all_sheets(
+            differ = DifferFactory.get_differ(self.file1)
+            summary = differ.compare_all(
                 self.file1, self.file2, 
                 key_columns=self.key_cols, 
                 header_row=self.header_row, 
@@ -420,11 +434,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.left_table = FrozenTableView()
         self.right_table = FrozenTableView()
-        for t in [self.left_table, self.right_table]:
+        self.diff_table = FrozenTableView()
+        
+        for t in [self.left_table, self.right_table, self.diff_table]:
             t.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
             t.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
             t.setAlternatingRowColors(True)
+            t.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+            t.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
             t.horizontalHeader().setStretchLastSection(True)
+            t.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            t.customContextMenuRequested.connect(lambda pos, table=t: self.show_table_context_menu(pos, table))
             
         self.splitter.addWidget(self.left_table)
         self.splitter.addWidget(self.right_table)
@@ -444,8 +464,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # Tab 2: 差异项列表 (只显示有差异的行)
         self.diff_tab = QtWidgets.QWidget()
         diff_tab_layout = QtWidgets.QVBoxLayout(self.diff_tab)
-        self.diff_table = FrozenTableView()
-        self.diff_table.setAlternatingRowColors(True)
         diff_tab_layout.addWidget(self.diff_table)
         self.tab_widget.addTab(self.diff_tab, "差异项总览")
         
@@ -526,8 +544,9 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             header_row = self.header_row_spin.value()
             has_header = not self.no_header_cb.isChecked()
-            df = ExcelDiffer.read_excel_raw(file1, sheet1, handle_merged=False, header_row=header_row, has_header=has_header)
-            columns = list(df.columns)
+            differ = DifferFactory.get_differ(file1)
+            df = differ.read_data(file1, sheet1, handle_merged=False, header_row=header_row, has_header=has_header)
+            columns = df.columns.tolist()
             dialog = KeyColumnsDialog(columns, self.key_columns, self)
             if dialog.exec_() == QtWidgets.QDialog.Accepted:
                 selected = dialog.selected_columns()
@@ -544,7 +563,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "错误", f"获取列信息失败: {e}")
 
     def browse_file(self, index):
-        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "选择 Excel 文件", "", "Excel files (*.xlsx *.xls)")
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "选择文件", "", "Data files (*.xlsx *.xls *.csv)")
         if not file_path:
             return
         if index == 1:
@@ -556,7 +575,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def load_sheets(self, filepath, combo):
         try:
-            sheets = ExcelDiffer.load_sheets(filepath)
+            differ = DifferFactory.get_differ(filepath)
+            sheets = differ.get_containers(filepath)
             combo.clear()
             combo.addItems(sheets)
             if sheets:
@@ -840,6 +860,9 @@ class MainWindow(QtWidgets.QMainWindow):
         row_height = int(value)
         for t in [self.left_table, self.right_table, self.diff_table]:
             t.verticalHeader().setDefaultSectionSize(row_height)
+            # 强制刷新所有行高（处理已经手动调整过的行）
+            for i in range(t.model().rowCount() if t.model() else 0):
+                t.setRowHeight(i, row_height)
             if hasattr(t, 'update_frozen_geometry'):
                 t.update_frozen_geometry()
 
@@ -851,9 +874,28 @@ class MainWindow(QtWidgets.QMainWindow):
             width = int(base_w * factor)
             self.left_table.setColumnWidth(i, width)
             self.right_table.setColumnWidth(i, width)
+            self.diff_table.setColumnWidth(i, width)
         
-        self.left_table.update_frozen_geometry()
-        self.right_table.update_frozen_geometry()
+        for t in [self.left_table, self.right_table, self.diff_table]:
+            if hasattr(t, 'update_frozen_geometry'):
+                t.update_frozen_geometry()
+
+    def show_table_context_menu(self, pos, table):
+        menu = QtWidgets.QMenu()
+        auto_fit_col_action = menu.addAction("自动调整此列宽度")
+        auto_fit_all_cols_action = menu.addAction("自动调整所有列宽")
+        menu.addSeparator()
+        reset_row_height_action = menu.addAction("重置行高")
+        
+        action = menu.exec_(table.viewport().mapToGlobal(pos))
+        if action == auto_fit_col_action:
+            index = table.indexAt(pos)
+            if index.isValid():
+                table.resizeColumnToContents(index.column())
+        elif action == auto_fit_all_cols_action:
+            table.resizeColumnsToContents()
+        elif action == reset_row_height_action:
+            self.apply_row_height(self.row_height_spin.value())
 
     def connect_selection(self):
         if self.left_table.selectionModel():
@@ -994,11 +1036,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.last_columns or self.all_results is None:
             QtWidgets.QMessageBox.warning(self, "提示", "没有可导出的比对结果")
             return
-        output_path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "导出比对结果", "比对结果.xlsx", "Excel files (*.xlsx)")
+        output_path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "导出比对结果", "比对结果.xlsx", "Excel files (*.xlsx);;CSV files (*.csv)")
         if not output_path:
             return
         try:
-            ExcelDiffer.export_diff(output_path, self.last_columns, self.all_results, self.key_columns)
+            key_cols = self.key_columns if self.key_mode_cb.isChecked() else None
+            differ = DifferFactory.get_differ(output_path if output_path.endswith('.csv') else self.file1_edit.text())
+            differ.export(output_path, self.last_columns, self.all_results, key_columns=key_cols)
             QtWidgets.QMessageBox.information(self, "成功", f"结果已成功导出至:\n{output_path}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "错误", f"导出失败: {e}")

@@ -4,10 +4,36 @@ import openpyxl
 import difflib
 from openpyxl.utils import range_boundaries
 from openpyxl.styles import PatternFill, Font, Alignment
+from src.logic.base_processor import BaseDiffer
 
-class ExcelDiffer:
+class ExcelDiffer(BaseDiffer):
     """Excel 比对逻辑处理类"""
     
+    def get_containers(self, filepath):
+        """实现 BaseDiffer 接口：获取 Sheet 列表"""
+        return self.load_sheets(filepath)
+
+    def read_data(self, filepath, container_name, **kwargs):
+        """实现 BaseDiffer 接口：读取 Excel 数据"""
+        handle_merged = kwargs.get('handle_merged', True)
+        header_row = kwargs.get('header_row', None)
+        has_header = kwargs.get('has_header', True)
+        return self.read_excel_raw(filepath, container_name, handle_merged, header_row, has_header)
+
+    def compare(self, df1, df2, key_columns=None, **kwargs):
+        """实现 BaseDiffer 接口：比对 DataFrame"""
+        return self.compare_dataframes(df1, df2, key_columns)
+
+    def export(self, filepath, columns, results, key_columns=None, **kwargs):
+        """实现 BaseDiffer 接口：导出 Excel"""
+        return self.export_diff(filepath, columns, results, key_columns)
+
+    def compare_all(self, file1, file2, key_columns=None, progress_callback=None, **kwargs):
+        """实现 BaseDiffer 接口：全表比对"""
+        header_row = kwargs.get('header_row', None)
+        has_header = kwargs.get('has_header', True)
+        return self.compare_all_sheets(file1, file2, key_columns, header_row, has_header, progress_callback)
+
     @staticmethod
     def load_sheets(filepath):
         """读取 Excel 文件的 Sheet 列表"""
