@@ -105,6 +105,47 @@ class TestExcelDiffer(unittest.TestCase):
         self.assertEqual(status_map.get('3'), 'deleted')
         self.assertEqual(str(added_id), '4')
 
+    def test_export_diff_enhanced(self):
+        """测试增强型导出功能"""
+        df1 = ExcelDiffer.read_excel_raw(self.file1, "Sheet1")
+        df2 = ExcelDiffer.read_excel_raw(self.file2, "Sheet1")
+        all_cols, results = ExcelDiffer.compare_dataframes(df1, df2, key_columns=["ID"])
+        
+        export_file = os.path.join(self.test_dir, "export_test.xlsx")
+        ExcelDiffer.export_diff(export_file, all_cols, results, key_columns=["ID"])
+        
+        self.assertTrue(os.path.exists(export_file))
+        
+        # 验证文件是否可以被 openpyxl 正常打开
+        import openpyxl
+        wb = openpyxl.load_workbook(export_file)
+        self.assertIn("对比视图", wb.sheetnames)
+        self.assertIn("差异清单", wb.sheetnames)
+        
+        ws1 = wb["对比视图"]
+        # 验证是否有冻结窗格
+        self.assertEqual(ws1.freeze_panes, "A2")
+        
+    def test_get_text_diff_plain(self):
+        """测试纯文本微观差异生成"""
+        old_val = "Hello World"
+        new_val = "Hello Python"
+        plain = ExcelDiffer.get_text_diff_plain(old_val, new_val)
+        self.assertIn("[-W-]", plain)
+        self.assertIn("[+Pyth+]", plain)
+        
+    def test_get_text_diff_html(self):
+        """测试文本微观差异生成"""
+        old_val = "Hello World"
+        new_val = "Hello Python"
+        html = ExcelDiffer.get_text_diff_html(old_val, new_val)
+        
+        # 验证是否包含 HTML 标签和关键词片段
+        self.assertIn("<span", html)
+        self.assertIn("style", html)
+        self.assertIn("line-through", html)  # 删除标记
+        self.assertIn("Pyth", html)         # 插入的内容片段
+        
     def test_read_excel_with_custom_header(self):
         """测试指定表头行号读取"""
         # 指定第 3 行为表头
@@ -134,6 +175,38 @@ class TestExcelDiffer(unittest.TestCase):
         df_empty = ExcelDiffer.read_excel_raw(self.file_empty, "Sheet1")
         all_cols, results = ExcelDiffer.compare_dataframes(df_empty, df_empty)
         self.assertEqual(len(results), 0)
+
+    def test_compare_all_sheets(self):
+        """测试全表自动比对逻辑"""
+        # 创建两个多 Sheet 的文件
+        file_a = os.path.join(self.test_dir, "multi_a.xlsx")
+        file_b = os.path.join(self.test_dir, "multi_b.xlsx")
+        
+        with pd.ExcelWriter(file_a) as writer:
+            pd.DataFrame({"A": [1, 2], "B": [3, 4]}).to_excel(writer, sheet_name="Common", index=False)
+            pd.DataFrame({"X": [1]}).to_excel(writer, sheet_name="OnlyA", index=False)
+            
+        with pd.ExcelWriter(file_b) as writer:
+            # Common Sheet 有差异
+            pd.DataFrame({"A": [1, 2], "B": [3, 5]}).to_excel(writer, sheet_name="Common", index=False)
+            pd.DataFrame({"Y": [1]}).to_excel(writer, sheet_name="OnlyB", index=False)
+            
+        summary = ExcelDiffer.compare_all_sheets(file_a, file_b)
+        
+        # 预期：
+        # 1. Common: success + stats['modified'] == 1
+        # 2. OnlyA: only_in_file1
+        # 3. OnlyB: only_in_file2
+        
+        common_res = [s for s in summary if s['sheet1'] == "Common"][0]
+        self.assertEqual(common_res['status'], 'success')
+        self.assertEqual(common_res['stats']['modified'], 1)
+        
+        only_a_res = [s for s in summary if s['sheet1'] == "OnlyA"][0]
+        self.assertEqual(only_a_res['status'], 'only_in_file1')
+        
+        only_b_res = [s for s in summary if s['sheet2'] == "OnlyB"][0]
+        self.assertEqual(only_b_res['status'], 'only_in_file2')
 
 if __name__ == '__main__':
     unittest.main()

@@ -33,6 +33,81 @@ class ExcelDiffer:
                 raise Exception(f"无法获取 Excel Sheet 列表: {e}")
 
     @staticmethod
+    def compare_all_sheets(file1, file2, key_columns=None, header_row=None, has_header=True, progress_callback=None):
+        """
+        全表自动比对逻辑：
+        1. 自动匹配两个文件中的 Sheet (基于名称相似度)
+        2. 对匹配成功的 Sheet 进行比对
+        3. 返回比对摘要
+        """
+        # 1. 获取 Sheet 列表
+        sheets1 = ExcelDiffer.load_sheets(file1)
+        sheets2 = ExcelDiffer.load_sheets(file2)
+        
+        # 2. 自动匹配 Sheet
+        matched_sheets = [] # List of (sheet1, sheet2)
+        unmatched1 = list(sheets1)
+        unmatched2 = list(sheets2)
+        
+        # 优先完全匹配
+        for s1 in sheets1[:]:
+            if s1 in unmatched2:
+                matched_sheets.append((s1, s1))
+                unmatched1.remove(s1)
+                unmatched2.remove(s1)
+        
+        # 其次模糊匹配 (忽略大小写和空格)
+        for s1 in unmatched1[:]:
+            s1_clean = s1.strip().lower()
+            for s2 in unmatched2[:]:
+                if s2.strip().lower() == s1_clean:
+                    matched_sheets.append((s1, s2))
+                    unmatched1.remove(s1)
+                    unmatched2.remove(s2)
+                    break
+        
+        # 3. 执行比对
+        results_summary = []
+        total = len(matched_sheets)
+        for i, (s1, s2) in enumerate(matched_sheets):
+            if progress_callback:
+                progress_callback(int((i / total) * 100), f"正在比对 Sheet: {s1}...")
+                
+            try:
+                df1 = ExcelDiffer.read_excel_raw(file1, s1, handle_merged=True, header_row=header_row, has_header=has_header)
+                df2 = ExcelDiffer.read_excel_raw(file2, s2, handle_merged=True, header_row=header_row, has_header=has_header)
+                
+                cols, results = ExcelDiffer.compare_dataframes(df1, df2, key_columns=key_columns)
+                
+                stats = {'added': 0, 'deleted': 0, 'modified': 0, 'equal': 0}
+                for r in results:
+                    status = r[2].get('status', 'equal')
+                    if status in stats:
+                        stats[status] += 1
+                
+                results_summary.append({
+                    'sheet1': s1,
+                    'sheet2': s2,
+                    'stats': stats,
+                    'status': 'success'
+                })
+            except Exception as e:
+                results_summary.append({
+                    'sheet1': s1,
+                    'sheet2': s2,
+                    'error': str(e),
+                    'status': 'error'
+                })
+        
+        # 记录未匹配的 Sheet
+        for s in unmatched1:
+            results_summary.append({'sheet1': s, 'sheet2': None, 'status': 'only_in_file1'})
+        for s in unmatched2:
+            results_summary.append({'sheet1': None, 'sheet2': s, 'status': 'only_in_file2'})
+            
+        return results_summary
+
+    @staticmethod
     def read_excel_raw(filepath, sheet_name=None, handle_merged=True, header_row=None, has_header=True):
         """
         极致健壮的 Excel 读取逻辑：
@@ -162,6 +237,38 @@ class ExcelDiffer:
             return df_data.reset_index(drop=True)
         
         return df
+
+    @staticmethod
+    def get_text_diff_html(old_val, new_val):
+        """
+        计算两个文本的微观差异并返回 HTML 格式
+        使用 difflib 实现字符级对比
+        """
+        # 处理非字符串类型
+        s1 = str(old_val) if pd.notna(old_val) else ""
+        s2 = str(new_val) if pd.notna(new_val) else ""
+        
+        if s1 == s2:
+            return s1
+            
+        s = difflib.SequenceMatcher(None, s1, s2)
+        html = []
+        for tag, i1, i2, j1, j2 in s.get_opcodes():
+            if tag == 'equal':
+                html.append(s1[i1:i2])
+            elif tag == 'delete':
+                text = s1[i1:i2]
+                html.append(f'<span style="color: #d73a49; text-decoration: line-through; background-color: #ffeef0;">{text}</span>')
+            elif tag == 'insert':
+                text = s2[j1:j2]
+                html.append(f'<span style="color: #22863a; background-color: #e6ffed; font-weight: bold;">{text}</span>')
+            elif tag == 'replace':
+                text_old = s1[i1:i2]
+                text_new = s2[j1:j2]
+                html.append(f'<span style="color: #d73a49; text-decoration: line-through; background-color: #ffeef0;">{text_old}</span>')
+                html.append(f'<span style="color: #22863a; background-color: #e6ffed; font-weight: bold;">{text_new}</span>')
+        
+        return "".join(html)
 
     @staticmethod
     def compare_dataframes(df1, df2, key_columns=None):
@@ -386,32 +493,74 @@ class ExcelDiffer:
 
 
     @staticmethod
+    def get_text_diff_plain(old_val, new_val):
+        """
+        计算文本微观差异并返回易读的纯文本格式 (用于 Excel 批注)
+        """
+        s1 = str(old_val) if pd.notna(old_val) else ""
+        s2 = str(new_val) if pd.notna(new_val) else ""
+        if s1 == s2: return s1
+        
+        s = difflib.SequenceMatcher(None, s1, s2)
+        result = []
+        for tag, i1, i2, j1, j2 in s.get_opcodes():
+            if tag == 'equal':
+                result.append(s1[i1:i2])
+            elif tag == 'delete':
+                result.append(f"[-{s1[i1:i2]}-]")
+            elif tag == 'insert':
+                result.append(f"[+{s2[j1:j2]}+]")
+            elif tag == 'replace':
+                result.append(f"[-{s1[i1:i2]}-][+{s2[j1:j2]}+]")
+        return "".join(result)
+
+    @staticmethod
     def export_diff(output_path, columns, results, key_columns=None):
-        """将比对结果导出到 Excel，包含双窗视图和差异清单"""
+        """
+        将比对结果导出到 Excel，包含带格式的视图和差异清单。
+        增强：支持背景高亮、单元格批注、冻结窗格和自动列宽。
+        """
+        from openpyxl.comments import Comment
+        from openpyxl.styles import Alignment, Border, Side
+        
         wb = openpyxl.Workbook()
         
-        # --- Sheet 1: 双窗对比视图 ---
+        # --- 样式定义 ---
+        header_fill = PatternFill(start_color="B4C6E7", end_color="B4C6E7", fill_type="solid") # 雅致蓝
+        modified_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid") # 浅橙 (修改)
+        added_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid") # 浅绿 (新增)
+        deleted_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid") # 浅红 (删除)
+        
+        bold_font = Font(bold=True)
+        thin_border = Border(
+            left=Side(style='thin'), 
+            right=Side(style='thin'), 
+            top=Side(style='thin'), 
+            bottom=Side(style='thin')
+        )
+        center_align = Alignment(horizontal='center', vertical='center')
+        left_align = Alignment(horizontal='left', vertical='center', wrap_text=True)
+
+        # --- Sheet 1: 对比视图 ---
         ws1 = wb.active
         ws1.title = "对比视图"
+        ws1.freeze_panes = "A2" # 冻结首行
         
-        # 定义样式
-        header_fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
-        modified_fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
-        added_fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
-        deleted_fill = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")
-        bold_font = Font(bold=True)
-        
-        # 写入表头 (左右两部分)
         half_cols = len(columns)
+        # 写入表头
         for i, col in enumerate(columns):
-            # 左侧表头
-            cell_l = ws1.cell(row=1, column=i+1, value=f"旧_{col}")
-            cell_l.fill = header_fill
-            cell_l.font = bold_font
-            # 右侧表头
-            cell_r = ws1.cell(row=1, column=i+half_cols+2, value=f"新_{col}")
-            cell_r.fill = header_fill
-            cell_r.font = bold_font
+            # 左侧 (旧)
+            c1 = ws1.cell(row=1, column=i+1, value=f"旧_{col}")
+            c1.fill = header_fill
+            c1.font = bold_font
+            c1.alignment = center_align
+            c1.border = thin_border
+            # 右侧 (新)
+            c2 = ws1.cell(row=1, column=i+half_cols+2, value=f"新_{col}")
+            c2.fill = header_fill
+            c2.font = bold_font
+            c2.alignment = center_align
+            c2.border = thin_border
 
         # 写入数据
         for row_idx, (left_vals, right_vals, info) in enumerate(results):
@@ -422,26 +571,43 @@ class ExcelDiffer:
             # 左侧
             for col_idx, val in enumerate(left_vals):
                 cell = ws1.cell(row=excel_row, column=col_idx+1, value=str(val))
+                cell.border = thin_border
+                cell.alignment = left_align
                 if status == 'deleted':
                     cell.fill = deleted_fill
                 elif status == 'modified' and col_idx in diff_cols:
                     cell.fill = modified_fill
+                    # 为修改的单元格添加批注显示旧值
+                    # cell.comment = Comment(f"原值: {val}", "ExcelDiffer")
             
             # 右侧
             for col_idx, val in enumerate(right_vals):
                 cell = ws1.cell(row=excel_row, column=col_idx+half_cols+2, value=str(val))
+                cell.border = thin_border
+                cell.alignment = left_align
                 if status == 'added':
                     cell.fill = added_fill
                 elif status == 'modified' and col_idx in diff_cols:
                     cell.fill = modified_fill
+                    # 为修改的单元格添加详细差异批注
+                    old_val = left_vals[col_idx]
+                    diff_text = ExcelDiffer.get_text_diff_plain(old_val, val)
+                    cell.comment = Comment(f"差异明细:\n{diff_text}\n\n格式说明: [-删除-] [+新增+]", "ExcelDiffer")
 
-        # --- Sheet 2: 差异清单 (Change List) ---
+        # 自动调整列宽
+        for col_idx in range(1, (half_cols * 2) + 3):
+            ws1.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = 20
+
+        # --- Sheet 2: 差异清单 ---
         ws2 = wb.create_sheet("差异清单")
-        cl_headers = ["主键/位置", "状态", "修改项", "旧值 (旧文件)", "新值 (新文件)"]
+        ws2.freeze_panes = "A2"
+        cl_headers = ["主键/位置", "状态", "修改项", "旧值 (旧文件)", "新值 (新文件)", "微观差异说明"]
         for i, h in enumerate(cl_headers):
             cell = ws2.cell(row=1, column=i+1, value=h)
             cell.fill = header_fill
             cell.font = bold_font
+            cell.alignment = center_align
+            cell.border = thin_border
         
         # 获取主键索引
         key_indices = []
@@ -450,7 +616,7 @@ class ExcelDiffer:
                 if kc in columns:
                     key_indices.append(columns.index(kc))
         
-        cl_row = 2
+        curr_row = 2
         for i, (left_vals, right_vals, info) in enumerate(results):
             status = info.get('status', 'equal')
             if status == 'equal':
@@ -466,41 +632,35 @@ class ExcelDiffer:
                 key_info = f"第 {i+1} 行"
             
             if status == 'modified':
-                for c_idx in info.get('diff_cols', []):
-                    ws2.cell(row=cl_row, column=1, value=key_info)
-                    ws2.cell(row=cl_row, column=2, value=status_text)
-                    ws2.cell(row=cl_row, column=3, value=columns[c_idx])
-                    ws2.cell(row=cl_row, column=4, value=str(left_vals[c_idx]))
-                    ws2.cell(row=cl_row, column=5, value=str(right_vals[c_idx]))
-                    # 修改项的高亮
-                    ws2.cell(row=cl_row, column=4).fill = modified_fill
-                    ws2.cell(row=cl_row, column=5).fill = modified_fill
-                    cl_row += 1
-            elif status == 'added':
-                ws2.cell(row=cl_row, column=1, value=key_info)
-                ws2.cell(row=cl_row, column=2, value=status_text)
-                ws2.cell(row=cl_row, column=3, value="整行")
-                ws2.cell(row=cl_row, column=5, value="(新增行)")
-                ws2.cell(row=cl_row, column=2).fill = added_fill
-                cl_row += 1
-            elif status == 'deleted':
-                ws2.cell(row=cl_row, column=1, value=key_info)
-                ws2.cell(row=cl_row, column=2, value=status_text)
-                ws2.cell(row=cl_row, column=3, value="整行")
-                ws2.cell(row=cl_row, column=4, value="(删除行)")
-                ws2.cell(row=cl_row, column=2).fill = deleted_fill
-                cl_row += 1
+                diff_cols = info.get('diff_cols', [])
+                for c_idx in diff_cols:
+                    col_name = columns[c_idx]
+                    l_val = left_vals[c_idx]
+                    r_val = right_vals[c_idx]
+                    diff_plain = ExcelDiffer.get_text_diff_plain(l_val, r_val)
+                    
+                    data = [key_info, status_text, col_name, str(l_val), str(r_val), diff_plain]
+                    for col_idx, val in enumerate(data):
+                        cell = ws2.cell(row=curr_row, column=col_idx+1, value=val)
+                        cell.border = thin_border
+                        cell.fill = modified_fill
+                    curr_row += 1
+            else:
+                # 新增或删除
+                fill = added_fill if status == 'added' else deleted_fill
+                data = [key_info, status_text, "整行", "", "", ""]
+                if status == 'added':
+                    data[4] = "(查看对比视图详情)"
+                else:
+                    data[3] = "(查看对比视图详情)"
+                    
+                for col_idx, val in enumerate(data):
+                    cell = ws2.cell(row=curr_row, column=col_idx+1, value=val)
+                    cell.border = thin_border
+                    cell.fill = fill
+                curr_row += 1
 
-        # 调整所有 Sheet 的列宽
-        for sheet in wb.worksheets:
-            for col in sheet.columns:
-                max_length = 0
-                column = col[0].column_letter
-                for cell in col:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except: pass
-                sheet.column_dimensions[column].width = min(max_length + 2, 60)
+        for col_idx in range(1, len(cl_headers) + 1):
+            ws2.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = 25
 
         wb.save(output_path)

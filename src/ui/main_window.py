@@ -1,9 +1,10 @@
 import os
 from PyQt5 import QtWidgets, QtCore, QtGui
 from src.logic.excel_processor import ExcelDiffer
+from src.ui.statistics_dialog import StatisticsDialog
+from src.ui.full_compare_dialog import FullCompareSummaryDialog
 from src.ui.frozen_table_view import FrozenTableView
 from src.ui.diff_table_model import DiffTableModel
-from src.ui.statistics_dialog import StatisticsDialog
 
 
 class CompareWorker(QtCore.QObject):
@@ -38,6 +39,34 @@ class CompareWorker(QtCore.QObject):
             self.error.emit(str(e))
 
 
+class FullCompareWorker(QtCore.QObject):
+    progress = QtCore.pyqtSignal(int, str)
+    finished = QtCore.pyqtSignal(list)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, file1, file2, key_cols, header_row=None, has_header=True):
+        super().__init__()
+        self.file1 = file1
+        self.file2 = file2
+        self.key_cols = key_cols
+        self.header_row = header_row
+        self.has_header = has_header
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            summary = ExcelDiffer.compare_all_sheets(
+                self.file1, self.file2, 
+                key_columns=self.key_cols, 
+                header_row=self.header_row, 
+                has_header=self.has_header,
+                progress_callback=self.progress.emit
+            )
+            self.finished.emit(summary)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class KeyColumnsDialog(QtWidgets.QDialog):
     def __init__(self, columns, selected, parent=None):
         super().__init__(parent)
@@ -67,6 +96,59 @@ class KeyColumnsDialog(QtWidgets.QDialog):
         return selected
 
 
+from src.logic.excel_processor import ExcelDiffer
+
+class HTMLDelegate(QtWidgets.QStyledItemDelegate):
+    """
+    用于在单元格内渲染 HTML 的委派类
+    """
+    def paint(self, painter, option, index):
+        options = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(options, index)
+
+        painter.save()
+        
+        doc = QtGui.QTextDocument()
+        # 处理可能存在的 None
+        text = options.text if options.text else ""
+        # 如果包含 HTML 标签，则按 HTML 渲染，否则按普通文本
+        if "<span" in text or "<b" in text or "<br" in text:
+            doc.setHtml(text)
+        else:
+            doc.setPlainText(text)
+
+        # 绘制背景
+        options.text = ""
+        style = options.widget.style()
+        style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, options, painter)
+
+        # 计算文本区域
+        textRect = style.subElementRect(QtWidgets.QStyle.SE_ItemViewItemText, options)
+        
+        # 居中对齐处理 (可选)
+        painter.translate(textRect.topLeft())
+        
+        # 设置绘制上下文
+        ctx = QtGui.QAbstractTextDocumentLayout.PaintContext()
+        # 处理选中时的文字颜色
+        if option.state & QtWidgets.QStyle.State_Selected:
+            ctx.palette.setColor(QtGui.QPalette.Text, option.palette.color(QtGui.QPalette.HighlightedText))
+        
+        # 绘制
+        doc.documentLayout().draw(painter, ctx)
+
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        options = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(options, index)
+        doc = QtGui.QTextDocument()
+        if "<span" in options.text:
+            doc.setHtml(options.text)
+        else:
+            doc.setPlainText(options.text)
+        return QtCore.QSize(int(doc.idealWidth()) + 10, int(doc.size().height()) + 5)
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, version):
         super().__init__()
@@ -86,6 +168,91 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setup_ui()
         self.setup_menu()
         self.set_window_icon()
+        self.load_settings()
+
+    def load_settings(self):
+        """从 QSettings 加载用户偏好设置"""
+        settings = QtCore.QSettings("MyCompany", "ExcelDiffer")
+        
+        # 窗口几何状态
+        geom = settings.value("geometry")
+        if geom:
+            self.restoreGeometry(geom)
+        state = settings.value("windowState")
+        if state:
+            self.restoreState(state)
+
+        # 文件路径 (只恢复目录，防止文件不存在报错)
+        f1 = settings.value("file1", "")
+        f2 = settings.value("file2", "")
+        if f1 and os.path.exists(f1):
+            self.file1_edit.setText(f1)
+            self.load_sheets(f1, self.sheet_combo1)
+            s1 = settings.value("sheet1", "")
+            if s1:
+                idx = self.sheet_combo1.findText(s1)
+                if idx >= 0:
+                    self.sheet_combo1.setCurrentIndex(idx)
+
+        if f2 and os.path.exists(f2):
+            self.file2_edit.setText(f2)
+            self.load_sheets(f2, self.sheet_combo2)
+            s2 = settings.value("sheet2", "")
+            if s2:
+                idx = self.sheet_combo2.findText(s2)
+                if idx >= 0:
+                    self.sheet_combo2.setCurrentIndex(idx)
+
+        # 比对配置
+        self.key_mode_cb.setChecked(settings.value("key_mode", False, type=bool))
+        self.key_columns = settings.value("key_columns", [])
+        if self.key_columns:
+            self.key_label.setText("已选: " + ", ".join(self.key_columns[:2]))
+            self.key_label.setStyleSheet("color: black; font-weight: bold;")
+        
+        self.no_header_cb.setChecked(settings.value("no_header", False, type=bool))
+        self.header_row_spin.setValue(settings.value("header_row", 1, type=int))
+
+        # 视图配置
+        self.sync_v_cb.setChecked(settings.value("sync_v", True, type=bool))
+        self.sync_h_cb.setChecked(settings.value("sync_h", True, type=bool))
+        self.freeze_row_spin.setValue(settings.value("freeze_row", 0, type=int))
+        self.freeze_col_spin.setValue(settings.value("freeze_col", 0, type=int))
+        self.row_height_spin.setValue(settings.value("row_height", 30, type=int))
+        self.col_width_spin.setValue(settings.value("col_width", 1.0, type=float))
+
+    def save_settings(self):
+        """保存用户偏好设置到 QSettings"""
+        settings = QtCore.QSettings("MyCompany", "ExcelDiffer")
+        
+        # 窗口几何状态
+        settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("windowState", self.saveState())
+
+        # 文件路径
+        settings.setValue("file1", self.file1_edit.text())
+        settings.setValue("file2", self.file2_edit.text())
+        settings.setValue("sheet1", self.sheet_combo1.currentText())
+        settings.setValue("sheet2", self.sheet_combo2.currentText())
+
+        # 比对配置
+        settings.setValue("key_mode", self.key_mode_cb.isChecked())
+        settings.setValue("key_columns", self.key_columns)
+        settings.setValue("no_header", self.no_header_cb.isChecked())
+        settings.setValue("header_row", self.header_row_spin.value())
+
+        # 视图配置
+        settings.setValue("sync_v", self.sync_v_cb.isChecked())
+        settings.setValue("sync_h", self.sync_h_cb.isChecked())
+        settings.setValue("freeze_row", self.freeze_row_spin.value())
+        settings.setValue("freeze_col", self.freeze_col_spin.value())
+        settings.setValue("row_height", self.row_height_spin.value())
+        settings.setValue("col_width", self.col_width_spin.value())
+
+    def closeEvent(self, event):
+        """窗口关闭前保存设置"""
+        self.save_settings()
+        super().closeEvent(event)
 
     def setup_menu(self):
         menubar = self.menuBar()
@@ -226,12 +393,17 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # 操作按钮
         self.compare_btn = QtWidgets.QPushButton("开始比对")
+        self.full_compare_btn = QtWidgets.QPushButton("全表比对")
         self.export_btn = QtWidgets.QPushButton("导出结果")
         self.compare_btn.setMinimumWidth(100)
+        self.full_compare_btn.setMinimumWidth(100)
         self.compare_btn.setStyleSheet("background-color: #0078d7; color: white; font-weight: bold; padding: 5px;")
+        self.full_compare_btn.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; padding: 5px;")
         self.compare_btn.clicked.connect(self.compare_files)
+        self.full_compare_btn.clicked.connect(self.compare_all_sheets)
         self.export_btn.clicked.connect(self.export_results)
         options_layout.addWidget(self.compare_btn)
+        options_layout.addWidget(self.full_compare_btn)
         options_layout.addWidget(self.export_btn)
         
         config_layout.addLayout(options_layout)
@@ -409,6 +581,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self.compare_btn.setEnabled(False)
+        self.full_compare_btn.setEnabled(False)
         self.progress_dialog = QtWidgets.QProgressDialog("正在处理中...", "", 0, 100, self)
         self.progress_dialog.setWindowTitle("请稍候")
         self.progress_dialog.setWindowModality(QtCore.Qt.ApplicationModal)
@@ -430,6 +603,59 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker_thread.finished.connect(self.worker.deleteLater)
         self.worker_thread.finished.connect(self.worker_thread.deleteLater)
         self.worker_thread.start()
+
+    def compare_all_sheets(self):
+        file1 = self.file1_edit.text().strip()
+        file2 = self.file2_edit.text().strip()
+        if not file1 or not file2:
+            QtWidgets.QMessageBox.warning(self, "提示", "请先选择两个 Excel 文件")
+            return
+        
+        key_cols = self.key_columns if self.key_mode_cb.isChecked() else None
+        # 全表比对时，如果开启了主键模式但没有选择列，提示用户
+        if self.key_mode_cb.isChecked() and not key_cols:
+            QtWidgets.QMessageBox.warning(self, "提示", "已开启主键比对模式，但未选择关键列。\n全表比对将尝试对所有 Sheet 应用相同的关键列，如果某些 Sheet 不包含这些列，可能会报错。")
+            # 允许继续，因为不同 Sheet 列名可能不同
+
+        self.compare_btn.setEnabled(False)
+        self.full_compare_btn.setEnabled(False)
+        self.progress_dialog = QtWidgets.QProgressDialog("正在开始全表比对...", "", 0, 100, self)
+        self.progress_dialog.setWindowTitle("全表比对中")
+        self.progress_dialog.setWindowModality(QtCore.Qt.ApplicationModal)
+        self.progress_dialog.setAutoClose(False)
+        self.progress_dialog.setAutoReset(False)
+        self.progress_dialog.show()
+
+        header_row = self.header_row_spin.value()
+        has_header = not self.no_header_cb.isChecked()
+        self.worker_thread = QtCore.QThread()
+        self.worker = FullCompareWorker(file1, file2, key_cols, header_row=header_row, has_header=has_header)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.on_full_compare_finished)
+        self.worker.error.connect(self.on_full_compare_error)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.error.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.start()
+
+    def on_full_compare_finished(self, summary):
+        if self.progress_dialog:
+            self.progress_dialog.close()
+        self.compare_btn.setEnabled(True)
+        self.full_compare_btn.setEnabled(True)
+        
+        dialog = FullCompareSummaryDialog(summary, self)
+        dialog.exec_()
+
+    def on_full_compare_error(self, message):
+        if self.progress_dialog:
+            self.progress_dialog.close()
+        self.compare_btn.setEnabled(True)
+        self.full_compare_btn.setEnabled(True)
+        QtWidgets.QMessageBox.critical(self, "全表比对错误", f"比对过程中发生错误: {message}")
 
     def update_progress(self, value, text):
         if self.progress_dialog:
@@ -540,7 +766,15 @@ class MainWindow(QtWidgets.QMainWindow):
                     col_name = columns[c_idx]
                     l_val = left_vals[c_idx]
                     r_val = right_vals[c_idx]
-                    diff_summary_data.append([key_info, status_text, col_name, l_val, r_val])
+                    
+                    # 生成微观差异 HTML
+                    diff_html = ExcelDiffer.get_text_diff_html(l_val, r_val)
+                    
+                    # 差异汇总表列：[主键/位置, 状态, 修改项, 旧值, 新值]
+                    # 我们在“新值”列显示微观差异，或者保持原样但在“新值”里高亮？
+                    # 用户的意思是高亮。我们直接把 diff_html 放在新值列。
+                    diff_summary_data.append([key_info, status_text, col_name, str(l_val), diff_html])
+                    
                     # 高亮“旧值”和“新值”列 (索引 3 和 4)
                     diff_summary_infos.append({
                         'status': 'modified', 
@@ -557,6 +791,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         diff_model = DiffTableModel(diff_summary_data, diff_summary_columns, diff_summary_infos, role_type="diff", parent=self)
         self.diff_table.setModel(diff_model)
+        
+        # 为“新值”列设置 HTML 委派
+        self.diff_table.setItemDelegateForColumn(4, HTMLDelegate(self.diff_table))
         
         # 4. 界面调整
         header = self.diff_table.horizontalHeader()
@@ -743,12 +980,14 @@ class MainWindow(QtWidgets.QMainWindow):
             elif status == "新增":
                 html_parts.append(f"<span style='color:#CC0000'>新值:</span> <span style='background:#CCFFCC'>{val2}</span><br><br>")
             else:
-                # 修改行，且该列有差异
+                # 单元格微观差异高亮
+                diff_html = ExcelDiffer.get_text_diff_html(val1, val2)
                 html_parts.append(f"<span style='color:#CC0000'>旧值:</span> <span style='background:#FFCCCC'>{val1}</span><br>")
-                html_parts.append(f"<span style='color:#CC0000'>新值:</span> <span style='background:#FFCCCC'>{val2}</span><br><br>")
-                
+                html_parts.append(f"<span style='color:#CC0000'>对比:</span> <span style='background:#FFCCCC'>{diff_html}</span><br><br>")
+        
         if not has_diff:
-            html_parts.append("<span style='color:#666666'>该行内容完全一致，无差异明细。</span>")
+            html_parts.append("<i>(该行所有列内容一致)</i>")
+        
         self.detail_text.setHtml("".join(html_parts))
 
     def export_results(self):
