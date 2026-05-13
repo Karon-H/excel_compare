@@ -154,8 +154,37 @@ cython_debug/
 .DS_Store
 Thumbs.db
 
-# Project specific
+# Project specific - data files
 *.xlsx.tmp
 ~$*.xlsx
+
+# ============================================================
+# 隐私保护：禁止将业务数据文件提交到仓库
+# ============================================================
+
+# 禁止所有 Excel 数据文件（仓库中不应包含实际业务数据）
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+
+# 禁止 CSV 数据文件
+*.csv
+
+# 禁止所有数据库文件
+*.db
+*.sqlite
+*.sqlite3
+
+# 禁止文档目录中的原始数据文件
+docs/*.xlsx
+docs/*.xls
+docs/*.csv
+
+# IDE/编辑器临时文件
+*.swp
+*.swo
+*~
+*.bak
 
 
