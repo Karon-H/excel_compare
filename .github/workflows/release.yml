@@ -1,8 +1,15 @@
 name: Build & Release
 
 on:
+  # 触发方式 1: 推送符合 V 开头的 tag 时自动构建（例如 git push --tags）
+  push:
+    tags:
+      - 'V*'
+      - 'v*'
+  # 触发方式 2: 在 GitHub Releases 页面手动发布时构建
   release:
     types: [published]
+  # 触发方式 3: 在 Actions 页面手动触发
   workflow_dispatch:
     inputs:
       version_tag:
@@ -37,9 +44,14 @@ jobs:
           # 使用项目的标准化打包框架进行构建
           python build_system/builder.py
 
-          # 获取构建产物名称 (从 updates_notes.txt 读取版本号)
-          $firstLine = Get-Content -Path "updates_notes.txt" -TotalCount 1
-          $version = if ($firstLine -match '^(V[\d.]+)') { $matches[1] } else { "Unknown" }
+          # 获取版本号: tag 触发时优先使用 tag 名，否则从文件读取
+          $version = ""
+          if ("${{ github.event_name }}" -eq "push" -and "${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}"
+          } else {
+            $firstLine = Get-Content -Path "updates_notes.txt" -TotalCount 1
+            $version = if ($firstLine -match '^(V[\d.]+)') { $matches[1] } else { "Unknown" }
+          }
           echo "version=$version" >> $env:GITHUB_OUTPUT
 
           # 获取 dist 目录中的输出
@@ -89,19 +101,20 @@ jobs:
           path: ${{ steps.zip.outputs.zipName }}
           retention-days: 7
 
-      - name: 上传到 Release
-        if: github.event_name == 'release'
+      - name: 创建/更新 Release 并上传产物
+        if: github.event_name == 'release' || github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.zip.outputs.zipName }}
+          generate_release_notes: true
           append_body: true
           body: |
             ## 📦 自动构建产物
-            
+
             - **版本**: ${{ steps.build.outputs.version }}
             - **平台**: Windows (x64)
-            - **构建时间**: ${{ github.event.release.created_at || '手动触发' }}
-            
+            - **触发方式**: ${{ github.event_name }}
+
             ### 使用说明
             1. 下载并解压 ZIP 包
             2. 运行 `Excel差异比对工具*.exe`
