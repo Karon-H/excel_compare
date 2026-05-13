@@ -37,67 +37,63 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: 运行构建系统
-        id: build
+      - name: 读取版本号
+        id: version
         shell: pwsh
         run: |
-          # 使用项目的标准化打包框架进行构建
-          python build_system/builder.py
-
-          # 获取版本号: tag 触发时优先使用 tag 名，否则从文件读取
-          $version = ""
+          # tag 触发时优先使用 tag 名，否则从文件读取
           if ("${{ github.event_name }}" -eq "push" -and "${{ github.ref_type }}" -eq "tag") {
             $version = "${{ github.ref_name }}"
           } else {
             $firstLine = Get-Content -Path "updates_notes.txt" -TotalCount 1
-            $version = if ($firstLine -match '^(V[\d.]+)') { $matches[1] } else { "Unknown" }
+            if ($firstLine -match '^(V[\d.]+)') {
+              $version = $matches[1]
+            } else {
+              $version = "Unknown"
+            }
           }
           echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "版本: $version"
 
-          # 获取 dist 目录中的输出
-          $items = Get-ChildItem -Path "dist"
-          echo "构建产物:"
-          $items | ForEach-Object { Write-Output "  - $($_.Name)" }
-
-      - name: 定位构建产物
-        id: artifact
+      - name: 执行 PyInstaller 打包
         shell: pwsh
         run: |
-          # 查找 dist 中最新生成的产物 (可能是目录或 .exe 文件)
-          $distItems = Get-ChildItem -Path "dist" | Where-Object {
-            $_.Name -ne "build" -and $_.Name -notlike "*_temp*"
-          } | Sort-Object LastWriteTime -Descending
+          python -m PyInstaller --noconfirm build_system/templates/excel_compare.spec
+          echo "打包完成，dist 目录内容:"
+          Get-ChildItem -Path "dist" -Name
 
-          if (-not $distItems) {
+      - name: 定位并打包构建产物
+        id: zip
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $distDir = "dist"
+
+          # 查找产物：排除 build 目录
+          $items = Get-ChildItem -Path $distDir | Where-Object { $_.Name -ne "build" }
+          if (-not $items) {
             Write-Error "未找到构建产物"
             exit 1
           }
 
-          $artifact = $distItems[0]
-          echo "artifactName=$($artifact.Name)" >> $env:GITHUB_OUTPUT
-          echo "artifactPath=$($artifact.FullName)" >> $env:GITHUB_OUTPUT
-          echo "isDirectory=$($artifact.PSIsContainer)" >> $env:GITHUB_OUTPUT
+          # 取最新的产物
+          $artifact = $items | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          Write-Output "找到产物: $($artifact.Name) (目录: $($artifact.PSIsContainer))"
 
-      - name: 打包产物 (ZIP)
-        id: zip
-        shell: pwsh
-        run: |
-          $artifactPath = "${{ steps.artifact.outputs.artifactPath }}"
-          $zipName = "${{ steps.build.outputs.version }}.zip"
-
-          if ("${{ steps.artifact.outputs.isDirectory }}" -eq "True") {
-            Compress-Archive -Path "$artifactPath\*" -DestinationPath "$zipName"
+          # 压缩
+          $zipName = "$version.zip"
+          if ($artifact.PSIsContainer) {
+            Compress-Archive -Path "$($artifact.FullName)\*" -DestinationPath $zipName
           } else {
-            Compress-Archive -Path "$artifactPath" -DestinationPath "$zipName"
+            Compress-Archive -Path $artifact.FullName -DestinationPath $zipName
           }
-
+          Write-Output "打包完成: $zipName ($((Get-Item $zipName).Length / 1MB -as [int]) MB)"
           echo "zipName=$zipName" >> $env:GITHUB_OUTPUT
-          echo "打包完成: $zipName"
 
       - name: 上传构建产物 (Artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.build.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
           path: ${{ steps.zip.outputs.zipName }}
           retention-days: 7
 
@@ -111,11 +107,13 @@ jobs:
           body: |
             ## 📦 自动构建产物
 
-            - **版本**: ${{ steps.build.outputs.version }}
+            - **版本**: ${{ steps.version.outputs.version }}
             - **平台**: Windows (x64)
             - **触发方式**: ${{ github.event_name }}
 
             ### 使用说明
             1. 下载并解压 ZIP 包
-            2. 运行 `Excel差异比对工具*.exe`
-            3. 确保解压路径不包含中文（如遇启动问题）
+            2. 运行 `ExcelCompareTool.exe`
+            3. 如遇启动问题，请确保解压路径不包含中文
+
+            > 此 Release 由 GitHub Actions 自动构建生成
